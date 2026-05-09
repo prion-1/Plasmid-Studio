@@ -1,7 +1,7 @@
 # Ignore everything by default.
 *
 
-# Project files currently needed by the Vite app.
+# Project files needed by the Vite app.
 !.gitignore
 !README.md
 !LICENSE
@@ -17,6 +17,10 @@ src/*
 !src/App.jsx
 !src/main.jsx
 !src/index.css
+
+# Demo
+!demo/
+!demo/*
 
 # Public files referenced by the app.
 !public/

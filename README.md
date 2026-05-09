@@ -26,6 +26,12 @@ Launch plasmid.studio:
   <img src="https://img.shields.io/badge/>-LAUNCH-2ea44f?style=for-the-badge" alt="Launch">
 </a>
 
+## Examples
+<p align="center">
+  <img src="./demo/scAAV.svg" width="45%" />
+  <img src="./demo/pExample.svg" width="45%" />
+</p>
+
 ## Development
 
 Install dependencies:
