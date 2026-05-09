@@ -1,0 +1,1912 @@
+import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
+import {
+  Plus, Trash2, ChevronDown, ChevronUp, ArrowRight, ArrowLeft,
+  Search, Hash, Download, AlertCircle, Eye, EyeOff, Tag
+} from 'lucide-react';
+
+/* ---------- constants ---------- */
+const R_DEFAULT = 200; // default plasmid radius
+const BAND_THICKNESS = 14;
+const RING_GAP = 8;
+const LABEL_OFFSET = 18;
+const VIEWBOX = 820; // -410 to 410
+
+// matplotlib plasma colormap, sampled at 10 evenly-spaced points
+const PALETTE_PLASMA = [
+  '#0d0887', '#46039f', '#7201a8', '#9c179e', '#bd3786',
+  '#d8576b', '#ed7953', '#fb9f3a', '#fdca26', '#f0f921',
+];
+
+// matplotlib viridis colormap, sampled at 10 evenly-spaced points
+// Standard reference values from matplotlib's viridis.
+const PALETTE_VIRIDIS = [
+  '#440154', '#482878', '#3e4a89', '#31688e', '#26828e',
+  '#1f9e89', '#35b779', '#6ece58', '#b5de2b', '#fde725',
+];
+
+const PALETTE = [...PALETTE_PLASMA, ...PALETTE_VIRIDIS];
+
+// darken a hex color for outlines / shading
+const darken = (hex, amount = 0.45) => {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  const dr = Math.max(0, Math.floor(r * (1 - amount)));
+  const dg = Math.max(0, Math.floor(g * (1 - amount)));
+  const db = Math.max(0, Math.floor(b * (1 - amount)));
+  return `#${dr.toString(16).padStart(2, '0')}${dg.toString(16).padStart(2, '0')}${db.toString(16).padStart(2, '0')}`;
+};
+
+// perceptual luminance for choosing readable text on a given bg
+const luminance = (hex) => {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16) / 255;
+  const g = parseInt(h.slice(2, 4), 16) / 255;
+  const b = parseInt(h.slice(4, 6), 16) / 255;
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+};
+
+const BG_PRESETS = [
+  '#F5F1EA', // cream (default)
+  '#FFFFFF', // pure white
+  '#F0EDE3', // warm paper
+  '#1F1B16', // ink
+  '#0E1A2B', // navy
+  '#1A1F1C', // forest
+];
+
+const FONT_OPTIONS = [
+  { label: 'Sans (Instrument)', value: "'Instrument Sans', system-ui, sans-serif" },
+  { label: 'Serif (Instrument)', value: "'Instrument Serif', Georgia, serif" },
+  { label: 'Mono (JetBrains)', value: "'JetBrains Mono', ui-monospace, monospace" },
+  { label: 'System sans', value: "system-ui, -apple-system, sans-serif" },
+  { label: 'System serif', value: "Georgia, 'Times New Roman', serif" },
+];
+
+// Highlight color presets — soft pastels (low saturation, work well at low opacity)
+const HIGHLIGHT_PALETTE = [
+  '#7FA67D', '#7B96B8', '#B88578', '#9B7DA8',
+  '#C7A86B', '#7FA8A3', '#B89C7F', '#A87878',
+];
+
+// matplotlib magma — sampled at 10 evenly-spaced points.
+const HIGHLIGHT_PALETTE_MAGMA = [
+  '#000004', '#170c3a', '#3b0f70', '#641a80', '#8c2981',
+  '#b63779', '#de4968', '#f6705b', '#fc9f6f', '#fcfdbf',
+];
+
+// matplotlib cividis — sampled at 10 evenly-spaced points.
+const HIGHLIGHT_PALETTE_CIVIDIS = [
+  '#00224e', '#123570', '#3b496c', '#575c6d', '#707173',
+  '#8a8678', '#a59c74', '#c3b369', '#e1cc55', '#fee838',
+];
+
+/* ---------- sequence helpers ---------- */
+const cleanSeq = (s) => (s || '').toUpperCase().replace(/[^ACGTN]/g, '');
+const COMPLEMENT = { A: 'T', T: 'A', C: 'G', G: 'C', N: 'N' };
+const revComp = (s) => s.split('').reverse().map(c => COMPLEMENT[c] || 'N').join('');
+
+const findSubseq = (plasmid, query) => {
+  if (!query || !plasmid) return null;
+  const q = cleanSeq(query);
+  if (!q || q.length > plasmid.length) return null;
+  const doubled = plasmid + plasmid;
+  let idx = doubled.indexOf(q);
+  if (idx !== -1 && idx < plasmid.length) {
+    const start = idx + 1;
+    const end = ((idx + q.length - 1) % plasmid.length) + 1;
+    return { start, end, direction: 'forward', length: q.length };
+  }
+  const rc = revComp(q);
+  idx = doubled.indexOf(rc);
+  if (idx !== -1 && idx < plasmid.length) {
+    const start = idx + 1;
+    const end = ((idx + rc.length - 1) % plasmid.length) + 1;
+    return { start, end, direction: 'reverse', length: q.length };
+  }
+  return null;
+};
+
+/* ---------- geometry ---------- */
+const angleAt = (pos, total) => -Math.PI / 2 + ((pos - 1) / total) * 2 * Math.PI;
+const polar = (a, r) => [Math.cos(a) * r, Math.sin(a) * r];
+
+const ringRadii = (n, thickness, R) => {
+  // Ring spacing is anchored to the constant BAND_THICKNESS — so individual
+  // annotations can grow or shrink without shifting other rings.
+  if (n === 0) {
+    return { inner: R - thickness / 2, outer: R + thickness / 2 };
+  }
+  const center = R + n * (BAND_THICKNESS + RING_GAP);
+  return { inner: center - thickness / 2, outer: center + thickness / 2 };
+};
+
+const computeAngles = (start, end, total) => {
+  const a1 = angleAt(start, total);
+  let span = end - start + 1;
+  if (span <= 0) span += total;
+  const sweep = (span / total) * 2 * Math.PI;
+  return { a1, a2: a1 + sweep, sweep };
+};
+
+const bandPath = (a1, a2, r1, r2) => {
+  const sweep = a2 - a1;
+  const largeArc = sweep > Math.PI ? 1 : 0;
+  const [x1o, y1o] = polar(a1, r2);
+  const [x2o, y2o] = polar(a2, r2);
+  const [x2i, y2i] = polar(a2, r1);
+  const [x1i, y1i] = polar(a1, r1);
+  return `M ${x1o} ${y1o} A ${r2} ${r2} 0 ${largeArc} 1 ${x2o} ${y2o} L ${x2i} ${y2i} A ${r1} ${r1} 0 ${largeArc} 0 ${x1i} ${y1i} Z`;
+};
+
+const arrowPath = (a1, a2, r1, r2, direction) => {
+  const sweep = a2 - a1;
+  const midR = (r1 + r2) / 2;
+  const tipPx = (r2 - r1) * 0.7; // arrowhead extension (30% shorter than thickness)
+  let tipAng = tipPx / midR;
+  tipAng = Math.min(tipAng, sweep * 0.5);
+  if (sweep < 0.001) {
+    const [x1o, y1o] = polar(a1, r2);
+    const [x1i, y1i] = polar(a1, r1);
+    const [xt, yt] = polar(a2, midR);
+    return `M ${x1o} ${y1o} L ${xt} ${yt} L ${x1i} ${y1i} Z`;
+  }
+  if (direction === 'forward') {
+    const aTipBase = a2 - tipAng;
+    const bodySweep = aTipBase - a1;
+    const largeArc = bodySweep > Math.PI ? 1 : 0;
+    const [x1o, y1o] = polar(a1, r2);
+    const [xtbo, ytbo] = polar(aTipBase, r2);
+    const [xtip, ytip] = polar(a2, midR);
+    const [xtbi, ytbi] = polar(aTipBase, r1);
+    const [x1i, y1i] = polar(a1, r1);
+    return `M ${x1o} ${y1o} A ${r2} ${r2} 0 ${largeArc} 1 ${xtbo} ${ytbo} L ${xtip} ${ytip} L ${xtbi} ${ytbi} A ${r1} ${r1} 0 ${largeArc} 0 ${x1i} ${y1i} Z`;
+  } else {
+    const aTipBase = a1 + tipAng;
+    const bodySweep = a2 - aTipBase;
+    const largeArc = bodySweep > Math.PI ? 1 : 0;
+    const [xtbo, ytbo] = polar(aTipBase, r2);
+    const [x2o, y2o] = polar(a2, r2);
+    const [x2i, y2i] = polar(a2, r1);
+    const [xtbi, ytbi] = polar(aTipBase, r1);
+    const [xtip, ytip] = polar(a1, midR);
+    return `M ${xtbo} ${ytbo} A ${r2} ${r2} 0 ${largeArc} 1 ${x2o} ${y2o} L ${x2i} ${y2i} A ${r1} ${r1} 0 ${largeArc} 0 ${xtbi} ${ytbi} L ${xtip} ${ytip} Z`;
+  }
+};
+
+const linePath = (a1, a2, r) => {
+  const sweep = a2 - a1;
+  const largeArc = sweep > Math.PI ? 1 : 0;
+  const [x1, y1] = polar(a1, r);
+  const [x2, y2] = polar(a2, r);
+  return `M ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2}`;
+};
+
+/* Rounded band: all 4 corners filleted with a circular arc of radius cr. */
+const roundedBandPath = (a1, a2, r1, r2, cr) => {
+  const thickness = r2 - r1;
+  const sweep = a2 - a1;
+  const arcLenInner = sweep * r1;
+  const arcLenOuter = sweep * r2;
+  cr = Math.max(0, Math.min(cr, thickness / 2 - 0.5, arcLenInner / 2 - 0.5, arcLenOuter / 2 - 0.5));
+  if (cr <= 0.5) return bandPath(a1, a2, r1, r2);
+
+  const angOuter = cr / r2;
+  const angInner = cr / r1;
+  const oStartA = a1 + angOuter;
+  const oEndA = a2 - angOuter;
+  const iStartA = a2 - angInner;
+  const iEndA = a1 + angInner;
+
+  const [oStartX, oStartY] = polar(oStartA, r2);
+  const [oEndX, oEndY] = polar(oEndA, r2);
+  const [endRadOutX, endRadOutY] = polar(a2, r2 - cr);
+  const [endRadInX, endRadInY] = polar(a2, r1 + cr);
+  const [iStartX, iStartY] = polar(iStartA, r1);
+  const [iEndX, iEndY] = polar(iEndA, r1);
+  const [startRadInX, startRadInY] = polar(a1, r1 + cr);
+  const [startRadOutX, startRadOutY] = polar(a1, r2 - cr);
+
+  const outerLA = (oEndA - oStartA) > Math.PI ? 1 : 0;
+  const innerLA = (iStartA - iEndA) > Math.PI ? 1 : 0;
+
+  return [
+    `M ${oStartX} ${oStartY}`,
+    `A ${r2} ${r2} 0 ${outerLA} 1 ${oEndX} ${oEndY}`,
+    `A ${cr} ${cr} 0 0 1 ${endRadOutX} ${endRadOutY}`,
+    `L ${endRadInX} ${endRadInY}`,
+    `A ${cr} ${cr} 0 0 1 ${iStartX} ${iStartY}`,
+    `A ${r1} ${r1} 0 ${innerLA} 0 ${iEndX} ${iEndY}`,
+    `A ${cr} ${cr} 0 0 1 ${startRadInX} ${startRadInY}`,
+    `L ${startRadOutX} ${startRadOutY}`,
+    `A ${cr} ${cr} 0 0 1 ${oStartX} ${oStartY}`,
+    'Z',
+  ].join(' ');
+};
+
+/* Rounded arrow: only the 2 *back* corners are rounded — the tip and pre-tip
+   corners stay sharp because that's what makes the arrow read as an arrow. */
+const roundedArrowPath = (a1, a2, r1, r2, direction, cr) => {
+  const sweep = a2 - a1;
+  const midR = (r1 + r2) / 2;
+  const thickness = r2 - r1;
+  const tipPx = thickness * 0.7; // 30% shorter arrowhead
+  let tipAng = tipPx / midR;
+  tipAng = Math.min(tipAng, sweep * 0.5);
+  if (sweep < 0.001) return arrowPath(a1, a2, r1, r2, direction);
+
+  // Body angular span (after subtracting arrowhead)
+  const bodySweep = sweep - tipAng;
+  cr = Math.max(0, Math.min(cr, thickness / 2 - 0.5, bodySweep * r1 / 2 - 0.5, bodySweep * r2 / 2 - 0.5));
+  if (cr <= 0.5) return arrowPath(a1, a2, r1, r2, direction);
+
+  if (direction === 'forward') {
+    const aTipBase = a2 - tipAng;
+    const angOuter = cr / r2;
+    const angInner = cr / r1;
+    const oStartA = a1 + angOuter;
+    const iEndA = a1 + angInner;
+    const outerLA = (aTipBase - oStartA) > Math.PI ? 1 : 0;
+    const innerLA = (aTipBase - iEndA) > Math.PI ? 1 : 0;
+
+    const [oStartX, oStartY] = polar(oStartA, r2);
+    const [tbtX, tbtY] = polar(aTipBase, r2);
+    const [tipX, tipY] = polar(a2, midR);
+    const [tbbX, tbbY] = polar(aTipBase, r1);
+    const [iEndX, iEndY] = polar(iEndA, r1);
+    const [bRadInX, bRadInY] = polar(a1, r1 + cr);
+    const [bRadOutX, bRadOutY] = polar(a1, r2 - cr);
+
+    return [
+      `M ${oStartX} ${oStartY}`,
+      `A ${r2} ${r2} 0 ${outerLA} 1 ${tbtX} ${tbtY}`,
+      `L ${tipX} ${tipY}`,
+      `L ${tbbX} ${tbbY}`,
+      `A ${r1} ${r1} 0 ${innerLA} 0 ${iEndX} ${iEndY}`,
+      `A ${cr} ${cr} 0 0 1 ${bRadInX} ${bRadInY}`,
+      `L ${bRadOutX} ${bRadOutY}`,
+      `A ${cr} ${cr} 0 0 1 ${oStartX} ${oStartY}`,
+      'Z',
+    ].join(' ');
+  } else {
+    // reverse: tip at a1, back corners at a2
+    const aTipBase = a1 + tipAng;
+    const angOuter = cr / r2;
+    const angInner = cr / r1;
+    const oEndA = a2 - angOuter;
+    const iStartA = a2 - angInner;
+    const outerLA = (oEndA - aTipBase) > Math.PI ? 1 : 0;
+    const innerLA = (iStartA - aTipBase) > Math.PI ? 1 : 0;
+
+    const [tipX, tipY] = polar(a1, midR);
+    const [tbtX, tbtY] = polar(aTipBase, r2);
+    const [oEndX, oEndY] = polar(oEndA, r2);
+    const [bRadOutX, bRadOutY] = polar(a2, r2 - cr);
+    const [bRadInX, bRadInY] = polar(a2, r1 + cr);
+    const [iStartX, iStartY] = polar(iStartA, r1);
+    const [tbbX, tbbY] = polar(aTipBase, r1);
+
+    return [
+      `M ${tipX} ${tipY}`,
+      `L ${tbtX} ${tbtY}`,
+      `A ${r2} ${r2} 0 ${outerLA} 1 ${oEndX} ${oEndY}`,
+      `A ${cr} ${cr} 0 0 1 ${bRadOutX} ${bRadOutY}`,
+      `L ${bRadInX} ${bRadInY}`,
+      `A ${cr} ${cr} 0 0 1 ${iStartX} ${iStartY}`,
+      `A ${r1} ${r1} 0 ${innerLA} 0 ${tbbX} ${tbbY}`,
+      `L ${tipX} ${tipY}`,
+      'Z',
+    ].join(' ');
+  }
+};
+
+const tickInterval = (total) => {
+  const target = total / 12;
+  const mags = [10, 20, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 50000];
+  for (const m of mags) if (m >= target) return m;
+  return 100000;
+};
+
+/* ---------- demo data ---------- */
+const generateDummySeq = (length, seed = 42) => {
+  const bases = 'ACGT';
+  let s = '';
+  let n = seed;
+  for (let i = 0; i < length; i++) {
+    n = (n * 9301 + 49297) % 233280;
+    s += bases[Math.floor((n / 233280) * 4)];
+  }
+  return s;
+};
+
+const initialAnnotations = [
+  { id: 1, name: 'AmpR', mode: 'position', querySeq: '', start: 200, end: 1050, direction: 'forward', color: '#46039f', outlineColor: null, ring: 1, shape: 'arrow', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
+  { id: 2, name: 'ori', mode: 'position', querySeq: '', start: 1300, end: 1900, direction: 'forward', color: '#d8576b', outlineColor: null, ring: 1, shape: 'arrow', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
+  { id: 3, name: 'MCS', mode: 'position', querySeq: '', start: 2200, end: 2300, direction: 'forward', color: '#fb9f3a', outlineColor: null, ring: 0, shape: 'block', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
+  { id: 4, name: 'T7 promoter', mode: 'position', querySeq: '', start: 2500, end: 2600, direction: 'forward', color: '#fdca26', outlineColor: null, ring: 2, shape: 'block', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
+];
+
+/* ---------- small UI primitives ---------- */
+const Field = ({ label, children, hint }) => (
+  <label className="block">
+    <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">{label}</div>
+    {children}
+    {hint && <div className="text-[10px] text-[var(--muted)] mt-1 italic">{hint}</div>}
+  </label>
+);
+
+const Input = (props) => (
+  <input
+    {...props}
+    className={`w-full bg-[var(--bg)] border border-[var(--border)] rounded-md px-2.5 py-1.5 text-[13px] text-[var(--ink)] placeholder:text-[var(--muted)] focus:outline-none focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)] transition-colors ${props.className || ''}`}
+  />
+);
+
+const TextArea = (props) => (
+  <textarea
+    {...props}
+    className={`w-full bg-[var(--bg)] border border-[var(--border)] rounded-md px-2.5 py-1.5 text-[12px] text-[var(--ink)] placeholder:text-[var(--muted)] focus:outline-none focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)] transition-colors font-mono ${props.className || ''}`}
+  />
+);
+
+const SegBtn = ({ active, onClick, children, title }) => (
+  <button
+    onClick={onClick}
+    title={title}
+    className={`flex-1 px-2 py-1.5 text-[11px] uppercase tracking-wider transition-all flex items-center justify-center gap-1 ${active ? 'bg-[var(--ink)] text-[var(--bg)]' : 'text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--border)]/40'}`}
+  >
+    {children}
+  </button>
+);
+
+/* ---------- main component ---------- */
+export default function PlasmidMapEditor() {
+  const [plasmidName, setPlasmidName] = useState('pExample');
+  const [plasmidSeqRaw, setPlasmidSeqRaw] = useState(generateDummySeq(3000));
+  const [annotations, setAnnotations] = useState(initialAnnotations);
+  const [hoveredId, setHoveredId] = useState(null);
+  const [showSeqInput, setShowSeqInput] = useState(false);
+  // canvas-level display settings
+  const [bgColor, setBgColor] = useState('#F5F1EA');
+  const [showName, setShowName] = useState(true);
+  const [showSize, setShowSize] = useState(true);
+  const [backboneThickness, setBackboneThickness] = useState(1.2);
+  const [backboneColor, setBackboneColor] = useState(null); // null = use theme
+  const [rotation, setRotation] = useState(0); // degrees, applies to ring content
+  const [radiusOffset, setRadiusOffset] = useState(0); // -100 to +150, modifies plasmid radius
+  // typography
+  const [fontFamily, setFontFamily] = useState("'Instrument Serif', Georgia, serif");
+  const [labelFontSize, setLabelFontSize] = useState(11.5);
+  const [tickFontSize, setTickFontSize] = useState(8.5);
+  const [nameFontSize, setNameFontSize] = useState(32);
+  const [textColor, setTextColor] = useState(null); // null = theme.ink
+  // highlights — translucent bands with curved labels
+  const [highlights, setHighlights] = useState([]);
+  const svgRef = useRef(null);
+  const listEndRef = useRef(null);
+  const idCounter = useRef(100);
+
+  // SVG theme — derived from bg luminance so labels stay readable on any bg
+  const theme = useMemo(() => {
+    const lum = luminance(bgColor);
+    const isDark = lum < 0.5;
+    return {
+      bg: bgColor,
+      ink: isDark ? '#F2EDE3' : '#1F1B16',
+      muted: isDark ? '#9A9182' : '#8A8174',
+      backbone: isDark ? '#C0B5A0' : '#3D3530',
+    };
+  }, [bgColor]);
+
+  const plasmidSeq = useMemo(() => cleanSeq(plasmidSeqRaw), [plasmidSeqRaw]);
+  const total = plasmidSeq.length;
+
+  // Active plasmid radius. Annotations and highlights scale in arc length with R
+  // (since their angular spans are anchored to genomic positions) but their
+  // thickness and the ring spacing stay fixed.
+  const currentR = R_DEFAULT + radiusOffset;
+
+  const resolved = useMemo(() => {
+    return annotations.map(ann => {
+      if (ann.mode === 'sequence') {
+        const found = findSubseq(plasmidSeq, ann.querySeq);
+        if (found) {
+          // Don't overwrite user's direction — surface match strand separately as `matchedDirection`
+          return {
+            ...ann,
+            start: found.start,
+            end: found.end,
+            matchedDirection: found.direction,
+            found: true,
+            error: null,
+          };
+        }
+        return { ...ann, found: false, error: ann.querySeq ? 'Not found in plasmid' : 'Enter a sequence' };
+      }
+      if (!ann.start || !ann.end || ann.start < 1 || ann.end < 1) {
+        return { ...ann, found: false, error: 'Enter start and end' };
+      }
+      if (ann.start > total || ann.end > total) {
+        return { ...ann, found: false, error: 'Position out of range' };
+      }
+      return { ...ann, found: true, error: null };
+    });
+  }, [annotations, plasmidSeq, total]);
+
+  const resolvedHighlights = useMemo(() => {
+    return highlights.map(hl => {
+      if (hl.mode === 'sequence') {
+        const found = findSubseq(plasmidSeq, hl.querySeq);
+        if (found) {
+          return { ...hl, start: found.start, end: found.end, matchedDirection: found.direction, found: true, error: null };
+        }
+        return { ...hl, found: false, error: hl.querySeq ? 'Not found in plasmid' : 'Enter a sequence' };
+      }
+      if (!hl.start || !hl.end || hl.start < 1 || hl.end < 1) {
+        return { ...hl, found: false, error: 'Enter start and end' };
+      }
+      if (hl.start > total || hl.end > total) {
+        return { ...hl, found: false, error: 'Position out of range' };
+      }
+      return { ...hl, found: true, error: null };
+    });
+  }, [highlights, plasmidSeq, total]);
+
+  const maxRing = useMemo(() => {
+    const r = Math.max(0, ...annotations.map(a => a.ring));
+    return Math.max(r, 1);
+  }, [annotations]);
+
+  // Label collision avoidance: annotations on the same ring with very close
+  // label angles get progressively pushed outward so labels don't overlap.
+  // Uses the labelPosition-adjusted angle, so manually shifting one of two
+  // co-located labels with the slider actually de-stacks them.
+  const labelLayout = useMemo(() => {
+    const groups = {};
+    for (const ann of resolved) {
+      if (!ann.found || !ann.showLabel) continue;
+      const { a1, a2 } = computeAngles(ann.start, ann.end, total);
+      const sweep = a2 - a1;
+      const labelA = a1 + sweep * (0.5 + (ann.labelPosition ?? 0) / 100);
+      if (!groups[ann.ring]) groups[ann.ring] = [];
+      groups[ann.ring].push({ id: ann.id, midA: labelA });
+    }
+    const layout = {};
+    const threshold = 0.05; // ~3°
+    for (const ring in groups) {
+      const items = groups[ring].sort((a, b) => a.midA - b.midA);
+      let prevA = -Infinity;
+      let stack = 0;
+      for (const item of items) {
+        if (item.midA - prevA < threshold) {
+          stack += 1;
+        } else {
+          stack = 0;
+        }
+        layout[item.id] = stack;
+        prevA = item.midA;
+      }
+    }
+    return layout;
+  }, [resolved, total]);
+
+  const addAnnotation = useCallback(() => {
+    const id = idCounter.current++;
+    const colorIdx = annotations.length % PALETTE.length;
+    const newAnn = {
+      id,
+      name: `Feature ${annotations.length + 1}`,
+      mode: 'sequence',
+      querySeq: '',
+      start: 1,
+      end: 100,
+      direction: 'forward',
+      color: PALETTE[colorIdx],
+      outlineColor: null,
+      ring: 0,
+      shape: 'arrow',
+      sizeScale: 1,
+      cornerStyle: 'rounded',
+      showLabel: true,
+      collapsed: false,
+    };
+    setAnnotations(prev => [...prev, newAnn]);
+    setTimeout(() => listEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }), 50);
+  }, [annotations.length]);
+
+  const updateAnn = useCallback((id, updates) => {
+    setAnnotations(prev => prev.map(a => a.id === id ? { ...a, ...updates } : a));
+  }, []);
+
+  const removeAnn = useCallback((id) => {
+    setAnnotations(prev => prev.filter(a => a.id !== id));
+  }, []);
+
+  const addHighlight = useCallback(() => {
+    const id = idCounter.current++;
+    const colorIdx = highlights.length % HIGHLIGHT_PALETTE.length;
+    const newHl = {
+      id,
+      name: `Region ${highlights.length + 1}`,
+      mode: 'position',
+      querySeq: '',
+      start: 1,
+      end: Math.max(2, Math.floor(plasmidSeq.length / 4)),
+      color: HIGHLIGHT_PALETTE[colorIdx],
+      opacity: 0.25,
+      ring: 1,
+      sizeScale: 3,
+      cornerStyle: 'rounded',
+      labelSize: 13,
+      showBoundaries: true,
+      showLabel: true,
+      collapsed: false,
+    };
+    setHighlights(prev => [...prev, newHl]);
+  }, [highlights.length, plasmidSeq.length]);
+
+  const updateHighlight = useCallback((id, updates) => {
+    setHighlights(prev => prev.map(h => h.id === id ? { ...h, ...updates } : h));
+  }, []);
+
+  const removeHighlight = useCallback((id) => {
+    setHighlights(prev => prev.filter(h => h.id !== id));
+  }, []);
+
+  const downloadSVG = () => {
+    if (!svgRef.current) return;
+    const clone = svgRef.current.cloneNode(true);
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    const xml = new XMLSerializer().serializeToString(clone);
+    const blob = new Blob([`<?xml version="1.0" encoding="UTF-8"?>\n${xml}`], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${plasmidName || 'plasmid'}.svg`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const [confirmingBlank, setConfirmingBlank] = useState(false);
+
+  const blankAll = () => {
+    // Two-click confirm: first click arms the button, second click commits.
+    // (Avoids window.confirm, which is silently blocked in many sandboxed
+    // iframes including the artifact preview environment.)
+    if (!confirmingBlank) {
+      setConfirmingBlank(true);
+      // Auto-disarm after 4 seconds so the button doesn't stay hot indefinitely
+      setTimeout(() => setConfirmingBlank(false), 4000);
+      return;
+    }
+    setConfirmingBlank(false);
+    setPlasmidName('');
+    setPlasmidSeqRaw('');
+    setAnnotations([]);
+    setHighlights([]);
+    setRotation(0);
+    setRadiusOffset(0);
+    setHoveredId(null);
+    setShowSeqInput(true); // open input ready for paste
+  };
+
+  /* ---------- render ---------- */
+  const ticks = useMemo(() => {
+    if (!total) return [];
+    const interval = tickInterval(total);
+    const arr = [];
+    // When a ring-0 annotation grows thick enough to fully swallow the tick
+    // line (thickness/2 > 10 px), shift ticks and labels inward by the amount
+    // the annotation extends past the original tick's inner end.
+    const maxRing0HalfThickness = Math.max(0, ...resolved
+      .filter(a => a.found && a.ring === 0)
+      .map(a => (BAND_THICKNESS * (a.sizeScale ?? 1)) / 2));
+    const tickShift = Math.max(0, maxRing0HalfThickness - 10);
+    // Position 1 marker at 12 o'clock (same style as the rest)
+    {
+      const a = angleAt(1, total);
+      const [x1, y1] = polar(a, currentR - 4 - tickShift);
+      const [x2, y2] = polar(a, currentR - 10 - tickShift);
+      const [tx, ty] = polar(a, currentR - 32 - tickShift);
+      arr.push({ p: 1, a, x1, y1, x2, y2, tx, ty });
+    }
+    // Regular interval ticks
+    const lastTick = Math.floor(total / interval) * interval;
+    for (let p = interval; p <= total; p += interval) {
+      if (p === 1) continue;
+      // Omit last tick if its gap to position 1 is smaller than the interval —
+      // otherwise its label collides with the "1" at 12 o'clock.
+      if (p === lastTick && (total - p + 1) < interval) continue;
+      const a = angleAt(p, total);
+      const [x1, y1] = polar(a, currentR - 4 - tickShift);
+      const [x2, y2] = polar(a, currentR - 10 - tickShift);
+      const [tx, ty] = polar(a, currentR - 32 - tickShift);
+      arr.push({ p, a, x1, y1, x2, y2, tx, ty });
+    }
+    return arr;
+  }, [total, currentR, resolved]);
+
+  return (
+    <div className="w-full h-screen flex flex-col bg-[var(--bg)] text-[var(--ink)] overflow-hidden" style={{
+      '--bg': '#F5F1EA',
+      '--bg-tint': '#EFEAE0',
+      '--ink': '#1F1B16',
+      '--muted': '#8A8174',
+      '--border': '#D9D0BE',
+      '--border-strong': '#B8AE99',
+      '--accent': '#B8472D',
+      '--backbone': '#3D3530',
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+        body, html, #root { background: #F5F1EA; font-family: 'Instrument Sans', system-ui, sans-serif; }
+        input, button, select, textarea { font-family: inherit; }
+        .font-display { font-family: 'Instrument Serif', Georgia, serif; }
+        .font-ui { font-family: 'Instrument Sans', system-ui, sans-serif; }
+        .font-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+        textarea, input.font-mono, .font-mono { font-family: 'JetBrains Mono', ui-monospace, monospace !important; }
+        .annotation-hover { filter: brightness(1.1) drop-shadow(0 2px 4px rgba(31,27,22,0.18)); }
+        .scroll-fade::-webkit-scrollbar { width: 8px; }
+        .scroll-fade::-webkit-scrollbar-track { background: transparent; }
+        .scroll-fade::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        .scroll-fade::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+        .thickness-slider { -webkit-appearance: none; appearance: none; height: 4px; background: var(--border); border-radius: 2px; outline: none; cursor: pointer; }
+        .thickness-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--ink); border: 2px solid var(--bg); box-shadow: 0 1px 3px rgba(31,27,22,0.25); cursor: grab; transition: transform 0.1s; }
+        .thickness-slider::-webkit-slider-thumb:active { cursor: grabbing; transform: scale(1.15); }
+        .thickness-slider::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--ink); border: 2px solid var(--bg); box-shadow: 0 1px 3px rgba(31,27,22,0.25); cursor: grab; }
+        .thickness-slider::-moz-range-track { height: 4px; background: var(--border); border-radius: 2px; border: none; }
+      `}</style>
+
+      {/* Header */}
+      <header className="flex-shrink-0 border-b border-[var(--border)] px-6 py-3 flex items-center justify-between bg-[var(--bg)]">
+        <div className="flex items-baseline gap-3">
+          <div className="font-display text-[22px] italic leading-none">plasmid<span className="text-[var(--accent)]">.</span>studio</div>
+          <div className="text-[10px] uppercase tracking-[0.18em] text-[var(--muted)]">circular map editor</div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={blankAll}
+            className={`flex items-center gap-1.5 text-[12px] px-3 py-1.5 border rounded-md transition-colors ${confirmingBlank ? 'bg-[var(--accent)] text-white border-[var(--accent)]' : 'border-[var(--border-strong)] text-[var(--muted)] hover:bg-[var(--accent)] hover:text-white hover:border-[var(--accent)]'}`}
+            title={confirmingBlank ? 'Click again to confirm' : 'Clear sequence, name, annotations, and highlights'}
+          >
+            <Trash2 size={13} /> {confirmingBlank ? 'Click again to confirm' : 'Blank'}
+          </button>
+          <button
+            onClick={downloadSVG}
+            className="flex items-center gap-1.5 text-[12px] px-3 py-1.5 border border-[var(--border-strong)] rounded-md hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors"
+          >
+            <Download size={13} /> Export SVG
+          </button>
+        </div>
+      </header>
+
+      <div className="flex-1 flex min-h-0">
+        {/* Controls panel */}
+        <aside className="w-[420px] flex-shrink-0 border-r border-[var(--border)] flex flex-col min-h-0">
+          <div className="overflow-y-auto scroll-fade flex-1 p-5 space-y-4">
+            {/* Plasmid info card */}
+            <div className="bg-[var(--bg-tint)] border border-[var(--border)] rounded-lg p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)] font-semibold">Plasmid</div>
+                <div className="font-mono text-[11px] text-[var(--muted)]">{total.toLocaleString()} bp</div>
+              </div>
+              <Field label="Name">
+                <Input value={plasmidName} onChange={e => setPlasmidName(e.target.value)} placeholder="pUC19" />
+              </Field>
+              <div>
+                <button
+                  onClick={() => setShowSeqInput(v => !v)}
+                  className="text-[11px] text-[var(--muted)] hover:text-[var(--ink)] flex items-center gap-1 transition-colors"
+                >
+                  {showSeqInput ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                  {showSeqInput ? 'Hide' : 'Edit'} sequence
+                </button>
+                {showSeqInput && (
+                  <div className="mt-2">
+                    <TextArea
+                      value={plasmidSeqRaw}
+                      onChange={e => setPlasmidSeqRaw(e.target.value)}
+                      placeholder="Paste full plasmid sequence (ACGTN, whitespace OK)"
+                      rows={5}
+                      style={{ fontSize: 10, lineHeight: 1.4 }}
+                    />
+                    <div className="text-[10px] text-[var(--muted)] mt-1 italic">
+                      Length is recomputed automatically. Sequence-find annotations re-locate live.
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Canvas card */}
+            <div className="bg-[var(--bg-tint)] border border-[var(--border)] rounded-lg p-4 space-y-3">
+              <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)] font-semibold">Canvas</div>
+
+              {/* Background color */}
+              <div>
+                <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Background</div>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="color"
+                    value={bgColor}
+                    onChange={e => setBgColor(e.target.value)}
+                    className="w-8 h-8 rounded border border-[var(--border)] cursor-pointer bg-[var(--bg)]"
+                  />
+                  <div className="flex flex-wrap gap-1">
+                    {BG_PRESETS.map(c => (
+                      <button
+                        key={c}
+                        onClick={() => setBgColor(c)}
+                        className={`w-3.5 h-3.5 rounded-sm border hover:scale-125 transition-transform ${bgColor.toLowerCase() === c.toLowerCase() ? 'border-[var(--ink)] ring-1 ring-[var(--ink)]' : 'border-[var(--border-strong)]'}`}
+                        style={{ background: c }}
+                        title={c}
+                      />
+                    ))}
+                  </div>
+                </div>
+                <div className="text-[9.5px] text-[var(--muted)] mt-1 italic">
+                  Tick + label colors auto-adjust to stay readable.
+                </div>
+              </div>
+
+              {/* Backbone thickness + color */}
+              <div className="space-y-2 pt-1 border-t border-[var(--border)]">
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                    <span>Backbone thickness</span>
+                    <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                      {backboneThickness.toFixed(1)}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.4"
+                    max="8"
+                    step="0.1"
+                    value={backboneThickness}
+                    onChange={e => setBackboneThickness(parseFloat(e.target.value))}
+                    className="thickness-slider w-full"
+                  />
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Backbone color</div>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="color"
+                      value={backboneColor || theme.backbone}
+                      onChange={e => setBackboneColor(e.target.value)}
+                      className="w-8 h-8 rounded border border-[var(--border)] cursor-pointer bg-[var(--bg)]"
+                      title={backboneColor ? 'Custom color' : 'Auto (matches bg)'}
+                    />
+                    <button
+                      onClick={() => setBackboneColor(null)}
+                      className={`px-2 py-1 text-[10px] uppercase tracking-wider rounded border transition-colors ${backboneColor === null ? 'border-[var(--ink)] bg-[var(--ink)] text-[var(--bg)]' : 'border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--ink)]'}`}
+                      title="Auto-derive from background"
+                    >
+                      Auto
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Rotation */}
+              <div className="pt-1 border-t border-[var(--border)]">
+                <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                  <span>Rotation</span>
+                  <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                    {rotation}°
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="range"
+                    min="0"
+                    max="360"
+                    step="1"
+                    value={rotation}
+                    onChange={e => setRotation(parseInt(e.target.value))}
+                    className="thickness-slider flex-1"
+                  />
+                  <button
+                    onClick={() => setRotation(0)}
+                    className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                  >
+                    reset
+                  </button>
+                </div>
+              </div>
+
+              {/* Plasmid radius */}
+              <div className="pt-1 border-t border-[var(--border)]">
+                <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                  <span>Plasmid radius</span>
+                  <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                    {radiusOffset > 0 ? '+' : ''}{radiusOffset}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="range"
+                    min="-100"
+                    max="150"
+                    step="2"
+                    value={radiusOffset}
+                    onChange={e => setRadiusOffset(parseInt(e.target.value))}
+                    className="thickness-slider flex-1"
+                  />
+                  <button
+                    onClick={() => setRadiusOffset(0)}
+                    className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                  >
+                    reset
+                  </button>
+                </div>
+              </div>
+
+              {/* Typography */}
+              <div className="pt-1 border-t border-[var(--border)] space-y-2">
+                <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)] font-semibold pt-1">Typography</div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Font</div>
+                  <select
+                    value={fontFamily}
+                    onChange={e => setFontFamily(e.target.value)}
+                    className="w-full bg-[var(--bg)] border border-[var(--border)] rounded-md px-2.5 py-1.5 text-[12px] text-[var(--ink)] focus:outline-none focus:border-[var(--accent)] transition-colors"
+                    style={{ fontFamily }}
+                  >
+                    {FONT_OPTIONS.map(f => (
+                      <option key={f.value} value={f.value} style={{ fontFamily: f.value }}>{f.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                    <span>Annotation label size</span>
+                    <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{labelFontSize.toFixed(1)}</span>
+                  </div>
+                  <input type="range" min="8" max="20" step="0.5"
+                    value={labelFontSize}
+                    onChange={e => setLabelFontSize(parseFloat(e.target.value))}
+                    className="thickness-slider w-full" />
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                    <span>Tick label size</span>
+                    <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{tickFontSize.toFixed(1)}</span>
+                  </div>
+                  <input type="range" min="6" max="14" step="0.5"
+                    value={tickFontSize}
+                    onChange={e => setTickFontSize(parseFloat(e.target.value))}
+                    className="thickness-slider w-full" />
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                    <span>Plasmid name size</span>
+                    <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{nameFontSize}</span>
+                  </div>
+                  <input type="range" min="14" max="56" step="1"
+                    value={nameFontSize}
+                    onChange={e => setNameFontSize(parseInt(e.target.value))}
+                    className="thickness-slider w-full" />
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Text color</div>
+                  <div className="flex items-center gap-1.5">
+                    <input type="color"
+                      value={textColor || theme.ink}
+                      onChange={e => setTextColor(e.target.value)}
+                      className="w-8 h-8 rounded border border-[var(--border)] cursor-pointer bg-[var(--bg)]"
+                      title={textColor ? 'Custom' : 'Auto (theme)'}
+                    />
+                    <button
+                      onClick={() => setTextColor(null)}
+                      className={`px-2 py-1 text-[10px] uppercase tracking-wider rounded border transition-colors ${textColor === null ? 'border-[var(--ink)] bg-[var(--ink)] text-[var(--bg)]' : 'border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--ink)]'}`}
+                    >
+                      Auto
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Center label visibility */}
+              <div className="flex flex-col gap-1.5 pt-1 border-t border-[var(--border)]">
+                <button
+                  onClick={() => setShowName(v => !v)}
+                  className="flex items-center gap-2 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+                >
+                  {showName ? <Eye size={12} /> : <EyeOff size={12} />}
+                  Plasmid name {showName ? 'visible' : 'hidden'}
+                </button>
+                <button
+                  onClick={() => setShowSize(v => !v)}
+                  className="flex items-center gap-2 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+                >
+                  {showSize ? <Eye size={12} /> : <EyeOff size={12} />}
+                  Size label {showSize ? 'visible' : 'hidden'}
+                </button>
+              </div>
+            </div>
+
+            {/* Annotations list */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)] font-semibold">
+                  Annotations · {annotations.length}
+                </div>
+              </div>
+
+              {resolved.map((ann) => (
+                <AnnotationCard
+                  key={ann.id}
+                  ann={ann}
+                  total={total}
+                  onUpdate={(u) => updateAnn(ann.id, u)}
+                  onRemove={() => removeAnn(ann.id)}
+                  onHover={setHoveredId}
+                  isHovered={hoveredId === ann.id}
+                />
+              ))}
+
+              {annotations.length === 0 && (
+                <div className="text-center text-[12px] text-[var(--muted)] italic py-6 border border-dashed border-[var(--border)] rounded-lg">
+                  No annotations yet. Click + below to start.
+                </div>
+              )}
+
+              {/* + button — always at bottom of list */}
+              <button
+                onClick={addAnnotation}
+                className="w-full flex items-center justify-center gap-2 py-3 border border-dashed border-[var(--border-strong)] rounded-lg text-[12px] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--bg-tint)] transition-all uppercase tracking-wider"
+              >
+                <Plus size={14} /> Add annotation
+              </button>
+              <div ref={listEndRef} />
+            </div>
+
+            {/* Highlights list */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)] font-semibold">
+                  Highlights · {highlights.length}
+                </div>
+              </div>
+
+              {resolvedHighlights.map(hl => (
+                <HighlightCard
+                  key={hl.id}
+                  hl={hl}
+                  total={total}
+                  onUpdate={(u) => updateHighlight(hl.id, u)}
+                  onRemove={() => removeHighlight(hl.id)}
+                />
+              ))}
+
+              {highlights.length === 0 && (
+                <div className="text-center text-[12px] text-[var(--muted)] italic py-6 border border-dashed border-[var(--border)] rounded-lg">
+                  No highlights yet. Translucent bands across regions.
+                </div>
+              )}
+
+              <button
+                onClick={addHighlight}
+                className="w-full flex items-center justify-center gap-2 py-3 border border-dashed border-[var(--border-strong)] rounded-lg text-[12px] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--bg-tint)] transition-all uppercase tracking-wider"
+              >
+                <Plus size={14} /> Add highlight
+              </button>
+            </div>
+          </div>
+        </aside>
+
+        {/* Map canvas */}
+        <main
+          className="flex-1 flex items-center justify-center min-h-0 p-6 relative overflow-hidden transition-colors"
+          style={{ background: theme.bg }}
+        >
+          <div className="w-full h-full max-w-[800px] max-h-[800px] aspect-square">
+            <svg
+              ref={svgRef}
+              viewBox={`-${VIEWBOX/2} -${VIEWBOX/2} ${VIEWBOX} ${VIEWBOX}`}
+              className="w-full h-full"
+              style={{ overflow: 'visible', fontFamily }}
+            >
+              {/* Background — included in export */}
+              <rect
+                x={-VIEWBOX/2} y={-VIEWBOX/2}
+                width={VIEWBOX} height={VIEWBOX}
+                fill={theme.bg}
+              />
+
+              {/* Rotating ring — highlights, backbone, ticks, annotations all rotate together; center labels stay static */}
+              <g transform={`rotate(${rotation})`}>
+                {/* Highlights — translucent bands; rendered FIRST so they sit at the very back, behind the plasmid ring itself */}
+                {resolvedHighlights.filter(h => h.found).map(hl => (
+                  <Highlight
+                    key={hl.id}
+                    hl={hl}
+                    total={total}
+                    theme={theme}
+                    rotation={rotation}
+                    fontFamily={fontFamily}
+                    textColor={textColor}
+                    currentR={currentR}
+                  />
+                ))}
+
+                {/* Backbone */}
+                <circle
+                  cx="0" cy="0" r={currentR}
+                  fill="none"
+                  stroke={backboneColor || theme.backbone}
+                  strokeWidth={backboneThickness}
+                  opacity="0.85"
+                />
+
+                {/* Ticks */}
+                {ticks.map((t) => (
+                  <g key={t.p}>
+                    <line
+                      x1={t.x1} y1={t.y1} x2={t.x2} y2={t.y2}
+                      stroke={theme.backbone}
+                      strokeWidth="0.8"
+                      opacity="0.55"
+                    />
+                    <text
+                      x={t.tx} y={t.ty}
+                      fontSize={tickFontSize}
+                      fill={theme.muted}
+                      textAnchor="middle"
+                      dominantBaseline="middle"
+                      transform={`rotate(${-rotation} ${t.tx} ${t.ty})`}
+                      style={{ fontFamily, letterSpacing: '0.02em' }}
+                    >
+                      {t.p}
+                    </text>
+                  </g>
+                ))}
+
+                {/* Annotations — rendered on top */}
+                {resolved.filter(a => a.found).map(ann => (
+                  <Annotation
+                    key={ann.id}
+                    ann={ann}
+                    total={total}
+                    isHovered={hoveredId === ann.id}
+                    onHover={setHoveredId}
+                    theme={theme}
+                    labelStack={labelLayout[ann.id] || 0}
+                    rotation={rotation}
+                    fontFamily={fontFamily}
+                    labelFontSize={labelFontSize}
+                    textColor={textColor}
+                    currentR={currentR}
+                  />
+                ))}
+              </g>
+
+              {/* Center labels — static, do not rotate */}
+              {showName && (
+                <text x="0" y={showSize ? -8 : 6} textAnchor="middle" fontSize={nameFontSize} fill={textColor || theme.ink} style={{ fontFamily, fontStyle: 'italic' }}>
+                  {plasmidName || 'untitled'}
+                </text>
+              )}
+              {showSize && (
+                <text x="0" y={showName ? 18 : 6} textAnchor="middle" fontSize="11" fill={theme.muted} style={{ fontFamily, letterSpacing: '0.05em' }}>
+                  {total.toLocaleString()} bp
+                </text>
+              )}
+            </svg>
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- annotation drawing on the map ---------- */
+function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fontFamily, labelFontSize = 11.5, textColor, rotation = 0, currentR = R_DEFAULT }) {
+  const { a1, a2 } = computeAngles(ann.start, ann.end, total);
+  const sizeScale = ann.sizeScale ?? 1;
+  const thickness = BAND_THICKNESS * sizeScale;
+  const { inner, outer } = ringRadii(ann.ring, thickness, currentR);
+  const cornerRadius = thickness * 0.35; // proportional rounding
+  const cornerStyle = ann.cornerStyle ?? 'rounded';
+  const outlineColor = ann.outlineColor || darken(ann.color, 0.5);
+  const outlineWidth = 1.3;
+  let pathEl;
+  if (ann.shape === 'arrow') {
+    const d = cornerStyle === 'rounded'
+      ? roundedArrowPath(a1, a2, inner, outer, ann.direction, cornerRadius)
+      : arrowPath(a1, a2, inner, outer, ann.direction);
+    pathEl = (
+      <path
+        d={d}
+        fill={ann.color}
+        stroke={outlineColor}
+        strokeWidth={outlineWidth}
+        strokeLinejoin={cornerStyle === 'rounded' ? 'round' : 'miter'}
+        strokeLinecap={cornerStyle === 'rounded' ? 'round' : 'butt'}
+        opacity={1}
+        className={isHovered ? 'annotation-hover' : ''}
+        style={{ transition: 'filter 0.15s, opacity 0.15s' }}
+        onMouseEnter={() => onHover(ann.id)}
+        onMouseLeave={() => onHover(null)}
+      />
+    );
+  } else if (ann.shape === 'block') {
+    const d = cornerStyle === 'rounded'
+      ? roundedBandPath(a1, a2, inner, outer, cornerRadius)
+      : bandPath(a1, a2, inner, outer);
+    pathEl = (
+      <path
+        d={d}
+        fill={ann.color}
+        stroke={outlineColor}
+        strokeWidth={outlineWidth}
+        strokeLinejoin={cornerStyle === 'rounded' ? 'round' : 'miter'}
+        strokeLinecap={cornerStyle === 'rounded' ? 'round' : 'butt'}
+        opacity={1}
+        className={isHovered ? 'annotation-hover' : ''}
+        style={{ transition: 'filter 0.15s, opacity 0.15s' }}
+        onMouseEnter={() => onHover(ann.id)}
+        onMouseLeave={() => onHover(null)}
+      />
+    );
+  } else {
+    // line — stroke width scales with sizeScale, already round caps
+    const midR = (inner + outer) / 2;
+    const baseStroke = 3.5 * sizeScale;
+    pathEl = (
+      <path
+        d={linePath(a1, a2, midR)}
+        fill="none"
+        stroke={ann.color}
+        strokeWidth={isHovered ? baseStroke + 1 : baseStroke}
+        strokeLinecap="round"
+        opacity={1}
+        className={isHovered ? 'annotation-hover' : ''}
+        style={{ transition: 'all 0.15s' }}
+        onMouseEnter={() => onHover(ann.id)}
+        onMouseLeave={() => onHover(null)}
+      />
+    );
+  }
+
+  // label
+  let labelEl = null;
+  if (ann.showLabel) {
+    // labelPosition (-50..+50) shifts the label along the annotation's arc
+    // between its termini; 0 = center.
+    const sweep = a2 - a1;
+    const labelA = a1 + sweep * (0.5 + (ann.labelPosition ?? 0) / 100);
+    const labelR = outer + LABEL_OFFSET + labelStack * 16 + (ann.labelDistance ?? 0);
+    const [lx, ly] = polar(labelA, labelR);
+    const [lineStartX, lineStartY] = polar(labelA, outer + 2);
+    const [lineEndX, lineEndY] = polar(labelA, labelR - 4);
+    // Anchor based on screen-space angle (after rotation), so labels still
+    // extend outward from the circle even when ring is rotated.
+    const screenA = labelA + (rotation * Math.PI) / 180;
+    const cosA = Math.cos(screenA);
+    let anchor = 'middle';
+    if (cosA > 0.2) anchor = 'start';
+    else if (cosA < -0.2) anchor = 'end';
+    labelEl = (
+      <g style={{ pointerEvents: 'none' }}>
+        <line
+          x1={lineStartX} y1={lineStartY} x2={lineEndX} y2={lineEndY}
+          stroke={theme.backbone} strokeWidth="0.6" opacity="0.55"
+        />
+        <text
+          x={lx} y={ly}
+          textAnchor={anchor}
+          dominantBaseline="middle"
+          fontSize={labelFontSize}
+          fill={textColor || theme.ink}
+          transform={`rotate(${-rotation} ${lx} ${ly})`}
+          style={{ fontFamily, fontWeight: 500, letterSpacing: '0.01em' }}
+        >
+          {ann.name}
+        </text>
+      </g>
+    );
+  }
+
+  return <g>{pathEl}{labelEl}</g>;
+}
+
+/* ---------- highlight: translucent band with curved label ---------- */
+function Highlight({ hl, total, theme, fontFamily, textColor, rotation = 0, currentR = R_DEFAULT }) {
+  const { a1, a2 } = computeAngles(hl.start, hl.end, total);
+  const sizeScale = hl.sizeScale ?? 3;
+  const thickness = BAND_THICKNESS * sizeScale;
+  const { inner, outer } = ringRadii(hl.ring ?? 1, thickness, currentR);
+  const midR = (inner + outer) / 2;
+  const cornerStyle = hl.cornerStyle ?? 'rounded';
+  const cornerRadius = thickness * 0.2;
+  const opacity = hl.opacity ?? 0.25;
+  const labelSize = hl.labelSize ?? 13;
+
+  const bandD = cornerStyle === 'rounded'
+    ? roundedBandPath(a1, a2, inner, outer, cornerRadius)
+    : bandPath(a1, a2, inner, outer);
+
+  // Path for the curved label — by default sits on the band's midline, but
+  // labelDistance lets the user push it outward (positive) or pull it inward
+  // (negative) of the band.
+  const labelR = midR + (hl.labelDistance ?? 0);
+  const sweep = a2 - a1;
+  const largeArc = sweep > Math.PI ? 1 : 0;
+  const [px1, py1] = polar(a1, labelR);
+  const [px2, py2] = polar(a2, labelR);
+  const midA = (a1 + a2) / 2;
+  const rotatedMidA = midA + (rotation * Math.PI) / 180;
+  const flip = Math.sin(rotatedMidA) > 0;
+  const textPathD = flip
+    ? `M ${px2} ${py2} A ${labelR} ${labelR} 0 ${largeArc} 0 ${px1} ${py1}`
+    : `M ${px1} ${py1} A ${labelR} ${labelR} 0 ${largeArc} 1 ${px2} ${py2}`;
+
+  // Boundary dashed lines at start/end (extending from outer edge inward toward backbone)
+  const boundaryEls = hl.showBoundaries ? (() => {
+    const [b1ox, b1oy] = polar(a1, outer + 4);
+    const [b1ix, b1iy] = polar(a1, currentR - 6);
+    const [b2ox, b2oy] = polar(a2, outer + 4);
+    const [b2ix, b2iy] = polar(a2, currentR - 6);
+    return (
+      <g>
+        <line x1={b1ox} y1={b1oy} x2={b1ix} y2={b1iy}
+          stroke={hl.color} strokeWidth="1" strokeDasharray="3 3" opacity="0.7" />
+        <line x1={b2ox} y1={b2oy} x2={b2ix} y2={b2iy}
+          stroke={hl.color} strokeWidth="1" strokeDasharray="3 3" opacity="0.7" />
+      </g>
+    );
+  })() : null;
+
+  // Boundary position labels (tinted to match highlight) — counter-rotated upright
+  const boundaryLabels = hl.showBoundaries ? (() => {
+    const [t1x, t1y] = polar(a1, outer + 14);
+    const [t2x, t2y] = polar(a2, outer + 14);
+    return (
+      <g>
+        <text x={t1x} y={t1y} textAnchor="middle" dominantBaseline="middle"
+          fontSize="10" fill={hl.color}
+          transform={`rotate(${-rotation} ${t1x} ${t1y})`}
+          style={{ fontFamily, fontWeight: 600, letterSpacing: '0.02em' }}>
+          {hl.start}
+        </text>
+        <text x={t2x} y={t2y} textAnchor="middle" dominantBaseline="middle"
+          fontSize="10" fill={hl.color}
+          transform={`rotate(${-rotation} ${t2x} ${t2y})`}
+          style={{ fontFamily, fontWeight: 600, letterSpacing: '0.02em' }}>
+          {hl.end}
+        </text>
+      </g>
+    );
+  })() : null;
+
+  const pathId = `hl-path-${hl.id}`;
+
+  return (
+    <g style={{ pointerEvents: 'none' }}>
+      <defs>
+        <path id={pathId} d={textPathD} fill="none" />
+      </defs>
+      {/* Translucent band */}
+      <path
+        d={bandD}
+        fill={hl.color}
+        stroke={hl.color}
+        strokeWidth="0.5"
+        strokeOpacity={Math.min(1, opacity * 2.5)}
+        fillOpacity={opacity}
+      />
+      {boundaryEls}
+      {boundaryLabels}
+      {/* Curved label along the band — labelOffset (-50..+50) slides it
+          between the two termini, with 0 at center. When the path is flipped
+          for bottom-hemisphere readability, invert so positive always moves
+          in the same physical direction along the band. */}
+      {hl.showLabel !== false && (() => {
+        const raw = hl.labelOffset ?? 0;
+        const offsetPct = flip ? (50 - raw) : (50 + raw);
+        return (
+          <text fontSize={labelSize} fill={textColor || hl.color}
+            style={{ fontFamily, fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+            <textPath href={`#${pathId}`} startOffset={`${offsetPct}%`} textAnchor="middle">
+              {hl.name}
+            </textPath>
+          </text>
+        );
+      })()}
+    </g>
+  );
+}
+
+/* ---------- annotation card in the panel ---------- */
+function AnnotationCard({ ann, total, onUpdate, onRemove, onHover, isHovered }) {
+  const collapsed = ann.collapsed;
+  return (
+    <div
+      onMouseEnter={() => onHover(ann.id)}
+      onMouseLeave={() => onHover(null)}
+      className={`bg-[var(--bg-tint)] border rounded-lg overflow-hidden transition-all ${isHovered ? 'border-[var(--ink)] shadow-sm' : 'border-[var(--border)]'}`}
+    >
+      {/* Header */}
+      <div className="flex items-center px-3 py-2 gap-2 cursor-pointer" onClick={() => onUpdate({ collapsed: !collapsed })}>
+        <div
+          className="w-3 h-3 rounded-sm flex-shrink-0"
+          style={{ background: ann.color }}
+        />
+        <div className="flex-1 text-[13px] font-medium truncate">{ann.name || <span className="italic text-[var(--muted)]">unnamed</span>}</div>
+        <div className="text-[9px] uppercase tracking-wider text-[var(--muted)] font-mono">
+          R{ann.ring}
+        </div>
+        {!ann.found && (
+          <AlertCircle size={12} className="text-[var(--accent)]" />
+        )}
+        <button
+          onClick={(e) => { e.stopPropagation(); onRemove(); }}
+          className="text-[var(--muted)] hover:text-[var(--accent)] p-0.5"
+          title="Delete"
+        >
+          <Trash2 size={13} />
+        </button>
+        {collapsed ? <ChevronDown size={14} className="text-[var(--muted)]" /> : <ChevronUp size={14} className="text-[var(--muted)]" />}
+      </div>
+
+      {!collapsed && (
+        <div className="px-3 pb-3 pt-1 space-y-3 border-t border-[var(--border)]">
+          {/* Name */}
+          <Field label="Name">
+            <Input value={ann.name} onChange={e => onUpdate({ name: e.target.value })} placeholder="e.g., AmpR" />
+          </Field>
+
+          {/* Mode toggle */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Locate by</div>
+            <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
+              <SegBtn
+                active={ann.mode === 'sequence'}
+                onClick={() => onUpdate({ mode: 'sequence' })}
+                title="Search subsequence in plasmid"
+              >
+                <Search size={11} /> Sequence
+              </SegBtn>
+              <SegBtn
+                active={ann.mode === 'position'}
+                onClick={() => onUpdate({ mode: 'position' })}
+                title="Specify start and end positions"
+              >
+                <Hash size={11} /> Position
+              </SegBtn>
+            </div>
+          </div>
+
+          {/* Position inputs */}
+          {ann.mode === 'sequence' ? (
+            <div>
+              <Field label="Subsequence">
+                <TextArea
+                  value={ann.querySeq}
+                  onChange={e => onUpdate({ querySeq: e.target.value })}
+                  placeholder="Paste sequence stretch (forward or reverse)"
+                  rows={2}
+                  style={{ fontSize: 10, lineHeight: 1.4 }}
+                />
+              </Field>
+              {ann.found && (
+                <div className="text-[10px] text-[var(--muted)] mt-1 font-mono flex items-center gap-2 flex-wrap">
+                  <span>→ {ann.start}–{ann.end}</span>
+                  <span className="opacity-60">·</span>
+                  <span>matched as {ann.matchedDirection === 'forward' ? 'forward' : 'reverse-complement'}</span>
+                  {ann.matchedDirection && ann.matchedDirection !== ann.direction && (
+                    <button
+                      onClick={() => onUpdate({ direction: ann.matchedDirection })}
+                      className="text-[var(--accent)] underline hover:no-underline"
+                      title="Set arrow direction to match the strand it was found on"
+                    >apply to arrow</button>
+                  )}
+                </div>
+              )}
+              {ann.error && (
+                <div className="text-[10px] text-[var(--accent)] mt-1 italic">{ann.error}</div>
+              )}
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="Start">
+                  <Input
+                    type="number" min={1} max={total}
+                    value={ann.start}
+                    onChange={e => onUpdate({ start: parseInt(e.target.value) || 0 })}
+                    className="font-mono"
+                  />
+                </Field>
+                <Field label="End">
+                  <Input
+                    type="number" min={1} max={total}
+                    value={ann.end}
+                    onChange={e => onUpdate({ end: parseInt(e.target.value) || 0 })}
+                    className="font-mono"
+                  />
+                </Field>
+              </div>
+              {ann.error && (
+                <div className="text-[10px] text-[var(--accent)] italic">{ann.error}</div>
+              )}
+            </>
+          )}
+
+          {/* Direction — always editable */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Arrow direction</div>
+            <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
+              <SegBtn active={ann.direction === 'forward'} onClick={() => onUpdate({ direction: 'forward' })}>
+                <ArrowRight size={11} /> Forward
+              </SegBtn>
+              <SegBtn active={ann.direction === 'reverse'} onClick={() => onUpdate({ direction: 'reverse' })}>
+                <ArrowLeft size={11} /> Reverse
+              </SegBtn>
+            </div>
+          </div>
+
+          {/* Shape */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Shape</div>
+            <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
+              <SegBtn active={ann.shape === 'arrow'} onClick={() => onUpdate({ shape: 'arrow' })}>Arrow</SegBtn>
+              <SegBtn active={ann.shape === 'block'} onClick={() => onUpdate({ shape: 'block' })}>Block</SegBtn>
+              <SegBtn active={ann.shape === 'line'} onClick={() => onUpdate({ shape: 'line' })}>Line</SegBtn>
+            </div>
+          </div>
+
+          {/* Corners */}
+          {ann.shape !== 'line' && (
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Corners</div>
+              <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
+                <SegBtn active={(ann.cornerStyle ?? 'rounded') === 'rounded'} onClick={() => onUpdate({ cornerStyle: 'rounded' })}>Rounded</SegBtn>
+                <SegBtn active={(ann.cornerStyle ?? 'rounded') === 'straight'} onClick={() => onUpdate({ cornerStyle: 'straight' })}>Straight</SegBtn>
+              </div>
+            </div>
+          )}
+
+          {/* Ring */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Ring</div>
+            <div className="flex items-center border border-[var(--border)] rounded-md overflow-hidden bg-[var(--bg)] max-w-[140px]">
+              <button
+                onClick={() => onUpdate({ ring: Math.max(0, ann.ring - 1) })}
+                className="px-2 py-1.5 text-[var(--muted)] hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors"
+              >−</button>
+              <div className="flex-1 text-center font-mono text-[12px]">{ann.ring}</div>
+              <button
+                onClick={() => onUpdate({ ring: Math.min(8, ann.ring + 1) })}
+                className="px-2 py-1.5 text-[var(--muted)] hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors"
+              >+</button>
+            </div>
+            <div className="text-[9.5px] text-[var(--muted)] mt-1 italic">
+              {ann.ring === 0 ? 'on backbone' : `ring ${ann.ring} outward`}
+            </div>
+          </div>
+
+          {/* Thickness */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+              <span>Thickness</span>
+              <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                {(ann.sizeScale ?? 1).toFixed(1)}×
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min="0.4"
+                max="5.0"
+                step="0.1"
+                value={ann.sizeScale ?? 1}
+                onChange={e => onUpdate({ sizeScale: parseFloat(e.target.value) })}
+                className="thickness-slider flex-1"
+              />
+              <button
+                onClick={() => onUpdate({ sizeScale: 1 })}
+                className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                title="Reset to 1.0×"
+              >
+                reset
+              </button>
+            </div>
+            {(ann.sizeScale ?? 1) > 2 && (
+              <div className="text-[9.5px] text-[var(--muted)] mt-1 italic">
+                may overlap adjacent rings
+              </div>
+            )}
+          </div>
+
+          {/* Fill color */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Fill</div>
+            <div className="flex items-start gap-1.5">
+              <input
+                type="color"
+                value={ann.color}
+                onChange={e => onUpdate({ color: e.target.value })}
+                className="w-8 h-8 rounded border border-[var(--border)] cursor-pointer bg-[var(--bg)] flex-shrink-0"
+              />
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-1">
+                  {PALETTE_PLASMA.map(c => (
+                    <button
+                      key={c}
+                      onClick={() => onUpdate({ color: c })}
+                      className="w-3.5 h-3.5 rounded-sm border border-[var(--border)] hover:scale-125 transition-transform"
+                      style={{ background: c }}
+                      title={c}
+                    />
+                  ))}
+                </div>
+                <div className="flex items-center gap-1">
+                  {PALETTE_VIRIDIS.map(c => (
+                    <button
+                      key={c}
+                      onClick={() => onUpdate({ color: c })}
+                      className="w-3.5 h-3.5 rounded-sm border border-[var(--border)] hover:scale-125 transition-transform"
+                      style={{ background: c }}
+                      title={c}
+                    />
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Outline color */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Outline</div>
+            <div className="flex items-center gap-1.5">
+              <input
+                type="color"
+                value={ann.outlineColor || darken(ann.color, 0.5)}
+                onChange={e => onUpdate({ outlineColor: e.target.value })}
+                className="w-8 h-8 rounded border border-[var(--border)] cursor-pointer bg-[var(--bg)]"
+                title={ann.outlineColor ? 'Custom outline color' : 'Auto (darkened fill)'}
+              />
+              <button
+                onClick={() => onUpdate({ outlineColor: null })}
+                className={`px-2 py-1 text-[10px] uppercase tracking-wider rounded border transition-colors ${ann.outlineColor === null ? 'border-[var(--ink)] bg-[var(--ink)] text-[var(--bg)]' : 'border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--ink)]'}`}
+                title="Reset to auto-darkened fill color"
+              >
+                Auto
+              </button>
+              {[ '#1F1B16', '#FFFFFF', '#000000' ].map(c => (
+                <button
+                  key={c}
+                  onClick={() => onUpdate({ outlineColor: c })}
+                  className={`w-5 h-5 rounded-sm border hover:scale-110 transition-transform ${ann.outlineColor && ann.outlineColor.toLowerCase() === c.toLowerCase() ? 'border-[var(--ink)] ring-1 ring-[var(--ink)]' : 'border-[var(--border-strong)]'}`}
+                  style={{ background: c }}
+                  title={c}
+                />
+              ))}
+            </div>
+            {ann.shape === 'line' && (
+              <div className="text-[9.5px] text-[var(--muted)] mt-1 italic">lines have no outline — fill color is used</div>
+            )}
+          </div>
+
+          {/* Label distance */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+              <span>Label distance</span>
+              <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                {(ann.labelDistance ?? 0) > 0 ? '+' : ''}{ann.labelDistance ?? 0}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min="-15" max="80" step="1"
+                value={ann.labelDistance ?? 0}
+                onChange={e => onUpdate({ labelDistance: parseInt(e.target.value) })}
+                className="thickness-slider flex-1"
+              />
+              <button
+                onClick={() => onUpdate({ labelDistance: 0 })}
+                className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                title="Reset to 0"
+              >
+                reset
+              </button>
+            </div>
+          </div>
+
+          {/* Label position along the annotation's arc */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+              <span>Label position</span>
+              <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                {(ann.labelPosition ?? 0) > 0 ? '+' : ''}{ann.labelPosition ?? 0}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="range" min="-50" max="50" step="1"
+                value={ann.labelPosition ?? 0}
+                onChange={e => onUpdate({ labelPosition: parseInt(e.target.value) })}
+                className="thickness-slider flex-1"
+              />
+              <button
+                onClick={() => onUpdate({ labelPosition: 0 })}
+                className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                title="Reset to 0 (centered)"
+              >
+                reset
+              </button>
+            </div>
+          </div>
+
+          {/* Show label toggle */}
+          <button
+            onClick={() => onUpdate({ showLabel: !ann.showLabel })}
+            className="flex items-center gap-1.5 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+          >
+            {ann.showLabel ? <Eye size={12} /> : <EyeOff size={12} />}
+            {ann.showLabel ? 'Label visible' : 'Label hidden'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- highlight card in the panel ---------- */
+function HighlightCard({ hl, total, onUpdate, onRemove }) {
+  const collapsed = hl.collapsed;
+  const valid = !hl.error;
+  return (
+    <div className="bg-[var(--bg-tint)] border border-[var(--border)] rounded-lg overflow-hidden">
+      <div className="flex items-center px-3 py-2 gap-2 cursor-pointer" onClick={() => onUpdate({ collapsed: !collapsed })}>
+        <div className="w-3 h-3 rounded-sm flex-shrink-0" style={{ background: hl.color, opacity: 0.5 }} />
+        <div className="flex-1 text-[13px] font-medium truncate">{hl.name || <span className="italic text-[var(--muted)]">unnamed</span>}</div>
+        <div className="text-[9px] uppercase tracking-wider text-[var(--muted)] font-mono">
+          R{hl.ring ?? 1}
+        </div>
+        {!valid && <AlertCircle size={12} className="text-[var(--accent)]" />}
+        <button
+          onClick={(e) => { e.stopPropagation(); onRemove(); }}
+          className="text-[var(--muted)] hover:text-[var(--accent)] p-0.5"
+        >
+          <Trash2 size={13} />
+        </button>
+        {collapsed ? <ChevronDown size={14} className="text-[var(--muted)]" /> : <ChevronUp size={14} className="text-[var(--muted)]" />}
+      </div>
+
+      {!collapsed && (
+        <div className="px-3 pb-3 pt-1 space-y-3 border-t border-[var(--border)]">
+          <Field label="Name">
+            <Input value={hl.name} onChange={e => onUpdate({ name: e.target.value })} placeholder="e.g., Sequencing Region" />
+          </Field>
+
+          {/* Mode toggle */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Locate by</div>
+            <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
+              <SegBtn active={hl.mode === 'sequence'} onClick={() => onUpdate({ mode: 'sequence' })} title="Search subsequence in plasmid">
+                <Search size={11} /> Sequence
+              </SegBtn>
+              <SegBtn active={(hl.mode ?? 'position') === 'position'} onClick={() => onUpdate({ mode: 'position' })} title="Specify start and end positions">
+                <Hash size={11} /> Position
+              </SegBtn>
+            </div>
+          </div>
+
+          {/* Position inputs — mode-dependent */}
+          {hl.mode === 'sequence' ? (
+            <div>
+              <Field label="Subsequence">
+                <TextArea
+                  value={hl.querySeq || ''}
+                  onChange={e => onUpdate({ querySeq: e.target.value })}
+                  placeholder="Paste sequence stretch (forward or reverse)"
+                  rows={2}
+                  style={{ fontSize: 10, lineHeight: 1.4 }}
+                />
+              </Field>
+              {hl.found && (
+                <div className="text-[10px] text-[var(--muted)] mt-1 font-mono flex items-center gap-2 flex-wrap">
+                  <span>→ {hl.start}–{hl.end}</span>
+                  {hl.matchedDirection && (
+                    <>
+                      <span className="opacity-60">·</span>
+                      <span>matched as {hl.matchedDirection === 'forward' ? 'forward' : 'reverse-complement'}</span>
+                    </>
+                  )}
+                </div>
+              )}
+              {hl.error && (
+                <div className="text-[10px] text-[var(--accent)] mt-1 italic">{hl.error}</div>
+              )}
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="Start">
+                  <Input type="number" min={1} max={total} value={hl.start}
+                    onChange={e => onUpdate({ start: parseInt(e.target.value) || 0 })}
+                    className="font-mono" />
+                </Field>
+                <Field label="End">
+                  <Input type="number" min={1} max={total} value={hl.end}
+                    onChange={e => onUpdate({ end: parseInt(e.target.value) || 0 })}
+                    className="font-mono" />
+                </Field>
+              </div>
+              {!valid && (
+                <div className="text-[10px] text-[var(--accent)] italic">Position out of range</div>
+              )}
+            </>
+          )}
+
+          {/* Corners */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Corners</div>
+            <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
+              <SegBtn active={(hl.cornerStyle ?? 'rounded') === 'rounded'} onClick={() => onUpdate({ cornerStyle: 'rounded' })}>Rounded</SegBtn>
+              <SegBtn active={(hl.cornerStyle ?? 'rounded') === 'straight'} onClick={() => onUpdate({ cornerStyle: 'straight' })}>Straight</SegBtn>
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Ring</div>
+            <div className="flex items-center border border-[var(--border)] rounded-md overflow-hidden bg-[var(--bg)] max-w-[140px]">
+              <button onClick={() => onUpdate({ ring: Math.max(0, (hl.ring ?? 1) - 1) })}
+                className="px-2 py-1.5 text-[var(--muted)] hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors">−</button>
+              <div className="flex-1 text-center font-mono text-[12px]">{hl.ring ?? 1}</div>
+              <button onClick={() => onUpdate({ ring: Math.min(8, (hl.ring ?? 1) + 1) })}
+                className="px-2 py-1.5 text-[var(--muted)] hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors">+</button>
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+              <span>Thickness</span>
+              <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{(hl.sizeScale ?? 3).toFixed(1)}×</span>
+            </div>
+            <input type="range" min="1" max="10" step="0.1"
+              value={hl.sizeScale ?? 3}
+              onChange={e => onUpdate({ sizeScale: parseFloat(e.target.value) })}
+              className="thickness-slider w-full" />
+            <button
+              onClick={() => {
+                // Set ring=1 and compute sizeScale so inner edge sits exactly on the backbone.
+                // Math: at ring=1, inner = R + (BAND_THICKNESS+RING_GAP) - thickness/2.
+                // Setting inner=R gives thickness = 2*(BAND_THICKNESS+RING_GAP),
+                // i.e. sizeScale = 2*(BAND_THICKNESS+RING_GAP)/BAND_THICKNESS.
+                const targetScale = (2 * (BAND_THICKNESS + RING_GAP)) / BAND_THICKNESS;
+                onUpdate({ ring: 1, sizeScale: parseFloat(targetScale.toFixed(2)) });
+              }}
+              className="mt-1.5 w-full text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] py-1 border border-[var(--border-strong)] rounded transition-colors"
+              title="Reset ring + thickness so the highlight's inner edge sits on the backbone"
+            >
+              Anchor to backbone
+            </button>
+          </div>
+
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+              <span>Opacity</span>
+              <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{Math.round((hl.opacity ?? 0.25) * 100)}%</span>
+            </div>
+            <input type="range" min="0.05" max="1" step="0.05"
+              value={hl.opacity ?? 0.25}
+              onChange={e => onUpdate({ opacity: parseFloat(e.target.value) })}
+              className="thickness-slider w-full" />
+          </div>
+
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Color</div>
+            <div className="flex items-start gap-1.5">
+              <input type="color" value={hl.color}
+                onChange={e => onUpdate({ color: e.target.value })}
+                className="w-8 h-8 rounded border border-[var(--border)] cursor-pointer bg-[var(--bg)] flex-shrink-0" />
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-1">
+                  {HIGHLIGHT_PALETTE.map(c => (
+                    <button key={c} onClick={() => onUpdate({ color: c })}
+                      className="w-3.5 h-3.5 rounded-sm border border-[var(--border)] hover:scale-125 transition-transform"
+                      style={{ background: c }} title={c} />
+                  ))}
+                </div>
+                <div className="flex items-center gap-1">
+                  {HIGHLIGHT_PALETTE_MAGMA.map(c => (
+                    <button key={c} onClick={() => onUpdate({ color: c })}
+                      className="w-3.5 h-3.5 rounded-sm border border-[var(--border)] hover:scale-125 transition-transform"
+                      style={{ background: c }} title={c} />
+                  ))}
+                </div>
+                <div className="flex items-center gap-1">
+                  {HIGHLIGHT_PALETTE_CIVIDIS.map(c => (
+                    <button key={c} onClick={() => onUpdate({ color: c })}
+                      className="w-3.5 h-3.5 rounded-sm border border-[var(--border)] hover:scale-125 transition-transform"
+                      style={{ background: c }} title={c} />
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+              <span>Label size</span>
+              <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{hl.labelSize ?? 13}</span>
+            </div>
+            <input type="range" min="8" max="24" step="1"
+              value={hl.labelSize ?? 13}
+              onChange={e => onUpdate({ labelSize: parseInt(e.target.value) })}
+              className="thickness-slider w-full" />
+          </div>
+
+          {/* Label distance from band midline */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+              <span>Label distance</span>
+              <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                {(hl.labelDistance ?? 0) > 0 ? '+' : ''}{hl.labelDistance ?? 0}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <input type="range" min="-40" max="80" step="1"
+                value={hl.labelDistance ?? 0}
+                onChange={e => onUpdate({ labelDistance: parseInt(e.target.value) })}
+                className="thickness-slider flex-1" />
+              <button
+                onClick={() => onUpdate({ labelDistance: 0 })}
+                className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                title="Reset to 0 (band midline)"
+              >
+                reset
+              </button>
+            </div>
+          </div>
+
+          {/* Label position along the band (between termini) */}
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+              <span>Label position</span>
+              <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                {(hl.labelOffset ?? 0) > 0 ? '+' : ''}{hl.labelOffset ?? 0}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <input type="range" min="-50" max="50" step="1"
+                value={hl.labelOffset ?? 0}
+                onChange={e => onUpdate({ labelOffset: parseInt(e.target.value) })}
+                className="thickness-slider flex-1" />
+              <button
+                onClick={() => onUpdate({ labelOffset: 0 })}
+                className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                title="Reset to 0 (centered)"
+              >
+                reset
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1.5 pt-1 border-t border-[var(--border)]">
+            <button
+              onClick={() => onUpdate({ showLabel: hl.showLabel === false })}
+              className="flex items-center gap-2 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+            >
+              {hl.showLabel !== false ? <Eye size={12} /> : <EyeOff size={12} />}
+              Curved label {hl.showLabel !== false ? 'visible' : 'hidden'}
+            </button>
+            <button
+              onClick={() => onUpdate({ showBoundaries: !hl.showBoundaries })}
+              className="flex items-center gap-2 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+            >
+              {hl.showBoundaries ? <Eye size={12} /> : <EyeOff size={12} />}
+              Boundary markers {hl.showBoundaries ? 'visible' : 'hidden'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

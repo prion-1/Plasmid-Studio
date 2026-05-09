@@ -1,0 +1,32 @@
+# Ignore everything by default.
+*
+
+# Project files currently needed by the Vite app.
+!.gitignore
+!README.md
+!LICENSE
+!index.html
+!package.json
+!package-lock.json
+!vite.config.js
+!eslint.config.js
+
+# App source files required by Vite.
+!src/
+src/*
+!src/App.jsx
+!src/main.jsx
+!src/index.css
+
+# Public files referenced by the app.
+!public/
+public/*
+!public/favicon.svg
+
+# GitHub Pages deployment workflows.
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/*.yml
+!.github/workflows/*.yaml
