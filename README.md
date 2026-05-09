@@ -20,6 +20,12 @@ an SVG.
   markers.
 - SVG export for publication figures, slides, and design notes.
 
+> [!tip]
+Launch plasmid.studio:
+<a href="https://prion-1.github.io/Plasmid-Studio/">
+  <img src="https://img.shields.io/badge/>-LAUNCH-2ea44f?style=for-the-badge" alt="Launch">
+</a>
+
 ## Development
 
 Install dependencies:
