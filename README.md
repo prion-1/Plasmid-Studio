@@ -36,7 +36,7 @@ Launch plasmid.studio:
   <img src="./demo/pExample.svg" width="45%" />
 </p>
 <p align="center">
-  <img src="./demo/Cargo.svg" width="91%" />
+  <img src="./demo/Cargo.svg" width="90%" />
 </p>
 
 ## Development
