@@ -1,7 +1,7 @@
-import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
+import { useState, useMemo, useRef, useCallback } from 'react';
 import {
   Plus, Trash2, ChevronDown, ChevronUp, ArrowRight, ArrowLeft,
-  Search, Hash, Download, AlertCircle, Eye, EyeOff, Tag
+  Search, Hash, Download, AlertCircle, Eye, EyeOff
 } from 'lucide-react';
 
 /* ---------- constants ---------- */
@@ -9,7 +9,14 @@ const R_DEFAULT = 200; // default plasmid radius
 const BAND_THICKNESS = 14;
 const RING_GAP = 8;
 const LABEL_OFFSET = 18;
+const DEFAULT_ANNOTATION_OUTLINE_WIDTH = 1.3;
 const VIEWBOX = 820; // -410 to 410
+const LINEAR_VIEWBOX_W = 820;
+const LINEAR_VIEWBOX_H = 520;
+const LINEAR_SEQ_LEFT = -315;
+const LINEAR_SEQ_RIGHT = 315;
+const LINEAR_SEQ_Y = 55;
+const LINEAR_TERMINUS_EXT = 46;
 
 // matplotlib plasma colormap, sampled at 10 evenly-spaced points
 const PALETTE_PLASMA = [
@@ -87,25 +94,54 @@ const cleanSeq = (s) => (s || '').toUpperCase().replace(/[^ACGTN]/g, '');
 const COMPLEMENT = { A: 'T', T: 'A', C: 'G', G: 'C', N: 'N' };
 const revComp = (s) => s.split('').reverse().map(c => COMPLEMENT[c] || 'N').join('');
 
-const findSubseq = (plasmid, query) => {
+const findSubseq = (plasmid, query, { circular = true } = {}) => {
   if (!query || !plasmid) return null;
   const q = cleanSeq(query);
   if (!q || q.length > plasmid.length) return null;
-  const doubled = plasmid + plasmid;
-  let idx = doubled.indexOf(q);
+  const searchSeq = circular ? plasmid + plasmid : plasmid;
+  let idx = searchSeq.indexOf(q);
   if (idx !== -1 && idx < plasmid.length) {
     const start = idx + 1;
-    const end = ((idx + q.length - 1) % plasmid.length) + 1;
+    const end = circular ? ((idx + q.length - 1) % plasmid.length) + 1 : idx + q.length;
     return { start, end, direction: 'forward', length: q.length };
   }
   const rc = revComp(q);
-  idx = doubled.indexOf(rc);
+  idx = searchSeq.indexOf(rc);
   if (idx !== -1 && idx < plasmid.length) {
     const start = idx + 1;
-    const end = ((idx + rc.length - 1) % plasmid.length) + 1;
+    const end = circular ? ((idx + rc.length - 1) % plasmid.length) + 1 : idx + rc.length;
     return { start, end, direction: 'reverse', length: q.length };
   }
   return null;
+};
+
+const resolveLocatedItems = (items, sequence, total, circular) => {
+  return items.map(item => {
+    if (item.mode === 'sequence') {
+      const found = findSubseq(sequence, item.querySeq, { circular });
+      if (found) {
+        return {
+          ...item,
+          start: found.start,
+          end: found.end,
+          matchedDirection: found.direction,
+          found: true,
+          error: null,
+        };
+      }
+      return { ...item, found: false, error: item.querySeq ? 'Not found in sequence' : 'Enter a sequence' };
+    }
+    if (!item.start || !item.end || item.start < 1 || item.end < 1) {
+      return { ...item, found: false, error: 'Enter start and end' };
+    }
+    if (item.start > total || item.end > total) {
+      return { ...item, found: false, error: 'Position out of range' };
+    }
+    if (!circular && item.end < item.start) {
+      return { ...item, found: false, error: 'End must be after start' };
+    }
+    return { ...item, found: true, error: null };
+  });
 };
 
 /* ---------- geometry ---------- */
@@ -119,7 +155,9 @@ const ringRadii = (n, thickness, R) => {
     return { inner: R - thickness / 2, outer: R + thickness / 2 };
   }
   const center = R + n * (BAND_THICKNESS + RING_GAP);
-  return { inner: center - thickness / 2, outer: center + thickness / 2 };
+  const inner = Math.max(1, center - thickness / 2);
+  const outer = Math.max(inner + 1, center + thickness / 2);
+  return { inner, outer };
 };
 
 const computeAngles = (start, end, total) => {
@@ -181,6 +219,91 @@ const linePath = (a1, a2, r) => {
   const [x1, y1] = polar(a1, r);
   const [x2, y2] = polar(a2, r);
   return `M ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2}`;
+};
+
+const linearSeqWidth = () => LINEAR_SEQ_RIGHT - LINEAR_SEQ_LEFT;
+
+const linearBaseX = (pos, total) => {
+  if (total <= 1) return LINEAR_SEQ_LEFT;
+  return LINEAR_SEQ_LEFT + ((pos - 1) / (total - 1)) * linearSeqWidth();
+};
+
+const linearRangeX = (start, end, total) => {
+  if (!total) return { x1: LINEAR_SEQ_LEFT, x2: LINEAR_SEQ_LEFT };
+  const x1 = LINEAR_SEQ_LEFT + ((start - 1) / total) * linearSeqWidth();
+  const x2 = LINEAR_SEQ_LEFT + (end / total) * linearSeqWidth();
+  return { x1, x2: Math.max(x1 + 2, x2) };
+};
+
+const linearTrackY = (ring = 0) => LINEAR_SEQ_Y - ring * (BAND_THICKNESS + RING_GAP);
+const trackMin = () => -8;
+const trackMax = () => 8;
+
+const linearBlockPath = (x1, x2, y, height, cornerStyle = 'rounded', cornerRadius = 0) => {
+  const top = y - height / 2;
+  const bottom = y + height / 2;
+  const width = Math.max(1, x2 - x1);
+  const cr = cornerStyle === 'rounded'
+    ? Math.max(0, Math.min(cornerRadius, height / 2 - 0.5, width / 2 - 0.5))
+    : 0;
+  if (cr <= 0.5) {
+    return `M ${x1} ${top} L ${x2} ${top} L ${x2} ${bottom} L ${x1} ${bottom} Z`;
+  }
+  return [
+    `M ${x1 + cr} ${top}`,
+    `L ${x2 - cr} ${top}`,
+    `Q ${x2} ${top} ${x2} ${top + cr}`,
+    `L ${x2} ${bottom - cr}`,
+    `Q ${x2} ${bottom} ${x2 - cr} ${bottom}`,
+    `L ${x1 + cr} ${bottom}`,
+    `Q ${x1} ${bottom} ${x1} ${bottom - cr}`,
+    `L ${x1} ${top + cr}`,
+    `Q ${x1} ${top} ${x1 + cr} ${top}`,
+    'Z',
+  ].join(' ');
+};
+
+const linearArrowPath = (x1, x2, y, height, direction, cornerStyle = 'rounded', cornerRadius = 0) => {
+  const top = y - height / 2;
+  const bottom = y + height / 2;
+  const width = Math.max(1, x2 - x1);
+  const head = Math.min(height * 0.7, width * 0.5);
+  const cr = cornerStyle === 'rounded'
+    ? Math.max(0, Math.min(cornerRadius, height / 2 - 0.5, Math.max(0, width - head) / 2 - 0.5))
+    : 0;
+
+  if (direction === 'reverse') {
+    const bodyStart = x1 + head;
+    if (cr <= 0.5) {
+      return `M ${x1} ${y} L ${bodyStart} ${top} L ${x2} ${top} L ${x2} ${bottom} L ${bodyStart} ${bottom} Z`;
+    }
+    return [
+      `M ${x1} ${y}`,
+      `L ${bodyStart} ${top}`,
+      `L ${x2 - cr} ${top}`,
+      `Q ${x2} ${top} ${x2} ${top + cr}`,
+      `L ${x2} ${bottom - cr}`,
+      `Q ${x2} ${bottom} ${x2 - cr} ${bottom}`,
+      `L ${bodyStart} ${bottom}`,
+      'Z',
+    ].join(' ');
+  }
+
+  const bodyEnd = x2 - head;
+  if (cr <= 0.5) {
+    return `M ${x1} ${top} L ${bodyEnd} ${top} L ${x2} ${y} L ${bodyEnd} ${bottom} L ${x1} ${bottom} Z`;
+  }
+  return [
+    `M ${x1 + cr} ${top}`,
+    `L ${bodyEnd} ${top}`,
+    `L ${x2} ${y}`,
+    `L ${bodyEnd} ${bottom}`,
+    `L ${x1 + cr} ${bottom}`,
+    `Q ${x1} ${bottom} ${x1} ${bottom - cr}`,
+    `L ${x1} ${top + cr}`,
+    `Q ${x1} ${top} ${x1 + cr} ${top}`,
+    'Z',
+  ].join(' ');
 };
 
 /* Rounded band: all 4 corners filleted with a circular arc of radius cr. */
@@ -321,11 +444,19 @@ const generateDummySeq = (length, seed = 42) => {
 };
 
 const initialAnnotations = [
-  { id: 1, name: 'AmpR', mode: 'position', querySeq: '', start: 200, end: 1050, direction: 'forward', color: '#46039f', outlineColor: null, ring: 1, shape: 'arrow', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
-  { id: 2, name: 'ori', mode: 'position', querySeq: '', start: 1300, end: 1900, direction: 'forward', color: '#d8576b', outlineColor: null, ring: 1, shape: 'arrow', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
-  { id: 3, name: 'MCS', mode: 'position', querySeq: '', start: 2200, end: 2300, direction: 'forward', color: '#fb9f3a', outlineColor: null, ring: 0, shape: 'block', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
-  { id: 4, name: 'T7 promoter', mode: 'position', querySeq: '', start: 2500, end: 2600, direction: 'forward', color: '#fdca26', outlineColor: null, ring: 2, shape: 'block', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
+  { id: 1, name: 'AmpR', mode: 'position', querySeq: '', start: 200, end: 1050, direction: 'forward', color: '#46039f', outlineColor: null, outlineWidth: DEFAULT_ANNOTATION_OUTLINE_WIDTH, ring: 1, shape: 'arrow', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
+  { id: 2, name: 'ori', mode: 'position', querySeq: '', start: 1300, end: 1900, direction: 'forward', color: '#d8576b', outlineColor: null, outlineWidth: DEFAULT_ANNOTATION_OUTLINE_WIDTH, ring: 1, shape: 'arrow', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
+  { id: 3, name: 'MCS', mode: 'position', querySeq: '', start: 2200, end: 2300, direction: 'forward', color: '#fb9f3a', outlineColor: null, outlineWidth: DEFAULT_ANNOTATION_OUTLINE_WIDTH, ring: 0, shape: 'block', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
+  { id: 4, name: 'T7 promoter', mode: 'position', querySeq: '', start: 2500, end: 2600, direction: 'forward', color: '#fdca26', outlineColor: null, outlineWidth: DEFAULT_ANNOTATION_OUTLINE_WIDTH, ring: 2, shape: 'block', sizeScale: 1, cornerStyle: 'rounded', showLabel: true, collapsed: true },
 ];
+
+const createDefaultTerminiLabels = () => ({
+  left: { visible: true, text: 'left terminus' },
+  right: { visible: true, text: 'right terminus' },
+  distance: 22,
+  size: 12,
+  color: null,
+});
 
 /* ---------- small UI primitives ---------- */
 const Field = ({ label, children, hint }) => (
@@ -362,6 +493,7 @@ const SegBtn = ({ active, onClick, children, title }) => (
 
 /* ---------- main component ---------- */
 export default function PlasmidMapEditor() {
+  const [activeView, setActiveView] = useState('plasmid');
   const [plasmidName, setPlasmidName] = useState('pExample');
   const [plasmidSeqRaw, setPlasmidSeqRaw] = useState(generateDummySeq(3000));
   const [annotations, setAnnotations] = useState(initialAnnotations);
@@ -371,21 +503,26 @@ export default function PlasmidMapEditor() {
   const [bgColor, setBgColor] = useState('#F5F1EA');
   const [showName, setShowName] = useState(true);
   const [showSize, setShowSize] = useState(true);
+  const [showTicks, setShowTicks] = useState(true);
   const [backboneThickness, setBackboneThickness] = useState(1.2);
   const [backboneColor, setBackboneColor] = useState(null); // null = use theme
   const [rotation, setRotation] = useState(0); // degrees, applies to ring content
   const [radiusOffset, setRadiusOffset] = useState(0); // -100 to +150, modifies plasmid radius
+  const [linearTermini, setLinearTermini] = useState('none');
+  const [terminiLabels, setTerminiLabels] = useState(createDefaultTerminiLabels);
   // typography
   const [fontFamily, setFontFamily] = useState("'Instrument Serif', Georgia, serif");
   const [labelFontSize, setLabelFontSize] = useState(11.5);
   const [tickFontSize, setTickFontSize] = useState(8.5);
   const [nameFontSize, setNameFontSize] = useState(32);
+  const [linearTitleDistance, setLinearTitleDistance] = useState(229);
   const [textColor, setTextColor] = useState(null); // null = theme.ink
   // highlights — translucent bands with curved labels
   const [highlights, setHighlights] = useState([]);
   const svgRef = useRef(null);
   const listEndRef = useRef(null);
   const idCounter = useRef(100);
+  const isPlasmidView = activeView === 'plasmid';
 
   // SVG theme — derived from bg luminance so labels stay readable on any bg
   const theme = useMemo(() => {
@@ -407,56 +544,13 @@ export default function PlasmidMapEditor() {
   // thickness and the ring spacing stay fixed.
   const currentR = R_DEFAULT + radiusOffset;
 
-  const resolved = useMemo(() => {
-    return annotations.map(ann => {
-      if (ann.mode === 'sequence') {
-        const found = findSubseq(plasmidSeq, ann.querySeq);
-        if (found) {
-          // Don't overwrite user's direction — surface match strand separately as `matchedDirection`
-          return {
-            ...ann,
-            start: found.start,
-            end: found.end,
-            matchedDirection: found.direction,
-            found: true,
-            error: null,
-          };
-        }
-        return { ...ann, found: false, error: ann.querySeq ? 'Not found in plasmid' : 'Enter a sequence' };
-      }
-      if (!ann.start || !ann.end || ann.start < 1 || ann.end < 1) {
-        return { ...ann, found: false, error: 'Enter start and end' };
-      }
-      if (ann.start > total || ann.end > total) {
-        return { ...ann, found: false, error: 'Position out of range' };
-      }
-      return { ...ann, found: true, error: null };
-    });
-  }, [annotations, plasmidSeq, total]);
+  const resolved = useMemo(() => (
+    resolveLocatedItems(annotations, plasmidSeq, total, isPlasmidView)
+  ), [annotations, plasmidSeq, total, isPlasmidView]);
 
-  const resolvedHighlights = useMemo(() => {
-    return highlights.map(hl => {
-      if (hl.mode === 'sequence') {
-        const found = findSubseq(plasmidSeq, hl.querySeq);
-        if (found) {
-          return { ...hl, start: found.start, end: found.end, matchedDirection: found.direction, found: true, error: null };
-        }
-        return { ...hl, found: false, error: hl.querySeq ? 'Not found in plasmid' : 'Enter a sequence' };
-      }
-      if (!hl.start || !hl.end || hl.start < 1 || hl.end < 1) {
-        return { ...hl, found: false, error: 'Enter start and end' };
-      }
-      if (hl.start > total || hl.end > total) {
-        return { ...hl, found: false, error: 'Position out of range' };
-      }
-      return { ...hl, found: true, error: null };
-    });
-  }, [highlights, plasmidSeq, total]);
-
-  const maxRing = useMemo(() => {
-    const r = Math.max(0, ...annotations.map(a => a.ring));
-    return Math.max(r, 1);
-  }, [annotations]);
+  const resolvedHighlights = useMemo(() => (
+    resolveLocatedItems(highlights, plasmidSeq, total, isPlasmidView)
+  ), [highlights, plasmidSeq, total, isPlasmidView]);
 
   // Label collision avoidance: annotations on the same ring with very close
   // label angles get progressively pushed outward so labels don't overlap.
@@ -491,6 +585,36 @@ export default function PlasmidMapEditor() {
     return layout;
   }, [resolved, total]);
 
+  const linearLabelLayout = useMemo(() => {
+    if (!total) return {};
+    const groups = {};
+    for (const ann of resolved) {
+      if (!ann.found || !ann.showLabel) continue;
+      const { x1, x2 } = linearRangeX(ann.start, ann.end, total);
+      const labelX = x1 + (x2 - x1) * (0.5 + (ann.labelPosition ?? 0) / 100);
+      const ring = ann.ring ?? 0;
+      if (!groups[ring]) groups[ring] = [];
+      groups[ring].push({ id: ann.id, x: labelX });
+    }
+    const layout = {};
+    const threshold = 56;
+    for (const ring in groups) {
+      const items = groups[ring].sort((a, b) => a.x - b.x);
+      let prevX = -Infinity;
+      let stack = 0;
+      for (const item of items) {
+        if (item.x - prevX < threshold) {
+          stack += 1;
+        } else {
+          stack = 0;
+        }
+        layout[item.id] = stack;
+        prevX = item.x;
+      }
+    }
+    return layout;
+  }, [resolved, total]);
+
   const addAnnotation = useCallback(() => {
     const id = idCounter.current++;
     const colorIdx = annotations.length % PALETTE.length;
@@ -504,6 +628,7 @@ export default function PlasmidMapEditor() {
       direction: 'forward',
       color: PALETTE[colorIdx],
       outlineColor: null,
+      outlineWidth: DEFAULT_ANNOTATION_OUTLINE_WIDTH,
       ring: 0,
       shape: 'arrow',
       sizeScale: 1,
@@ -554,6 +679,17 @@ export default function PlasmidMapEditor() {
     setHighlights(prev => prev.filter(h => h.id !== id));
   }, []);
 
+  const updateTerminiLabels = useCallback((updates) => {
+    setTerminiLabels(prev => ({ ...prev, ...updates }));
+  }, []);
+
+  const updateTerminiLabel = useCallback((side, updates) => {
+    setTerminiLabels(prev => ({
+      ...prev,
+      [side]: { ...prev[side], ...updates },
+    }));
+  }, []);
+
   const downloadSVG = () => {
     if (!svgRef.current) return;
     const clone = svgRef.current.cloneNode(true);
@@ -586,6 +722,10 @@ export default function PlasmidMapEditor() {
     setHighlights([]);
     setRotation(0);
     setRadiusOffset(0);
+    setLinearTermini('none');
+    setTerminiLabels(createDefaultTerminiLabels());
+    setLinearTitleDistance(229);
+    setShowTicks(true);
     setHoveredId(null);
     setShowSeqInput(true); // open input ready for paste
   };
@@ -626,6 +766,22 @@ export default function PlasmidMapEditor() {
     return arr;
   }, [total, currentR, resolved]);
 
+  const linearTicks = useMemo(() => {
+    if (!total) return [];
+    const interval = tickInterval(total);
+    const seen = new Set();
+    const arr = [];
+    const addTick = (p) => {
+      if (seen.has(p)) return;
+      seen.add(p);
+      arr.push({ p, x: linearBaseX(p, total) });
+    };
+    addTick(1);
+    for (let p = interval; p < total; p += interval) addTick(p);
+    if (total > 1) addTick(total);
+    return arr.sort((a, b) => a.p - b.p);
+  }, [total]);
+
   return (
     <div className="w-full h-screen flex flex-col bg-[var(--bg)] text-[var(--ink)] overflow-hidden" style={{
       '--bg': '#F5F1EA',
@@ -661,7 +817,9 @@ export default function PlasmidMapEditor() {
       <header className="flex-shrink-0 border-b border-[var(--border)] px-6 py-3 flex items-center justify-between bg-[var(--bg)]">
         <div className="flex items-baseline gap-3">
           <div className="font-display text-[22px] italic leading-none">plasmid<span className="text-[var(--accent)]">.</span>studio</div>
-          <div className="text-[10px] uppercase tracking-[0.18em] text-[var(--muted)]">circular map editor</div>
+          <div className="text-[10px] uppercase tracking-[0.18em] text-[var(--muted)]">
+            {isPlasmidView ? 'circular map editor' : 'linear sequence editor'}
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -683,15 +841,27 @@ export default function PlasmidMapEditor() {
       <div className="flex-1 flex min-h-0">
         {/* Controls panel */}
         <aside className="w-[420px] flex-shrink-0 border-r border-[var(--border)] flex flex-col min-h-0">
+          <div className="flex-shrink-0 p-3 border-b border-[var(--border)] bg-[var(--bg)]">
+            <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
+              <SegBtn active={isPlasmidView} onClick={() => setActiveView('plasmid')}>
+                Plasmid
+              </SegBtn>
+              <SegBtn active={!isPlasmidView} onClick={() => setActiveView('linear')}>
+                Linear sequence
+              </SegBtn>
+            </div>
+          </div>
           <div className="overflow-y-auto scroll-fade flex-1 p-5 space-y-4">
             {/* Plasmid info card */}
             <div className="bg-[var(--bg-tint)] border border-[var(--border)] rounded-lg p-4 space-y-3">
               <div className="flex items-center justify-between">
-                <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)] font-semibold">Plasmid</div>
+                <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)] font-semibold">
+                  {isPlasmidView ? 'Plasmid' : 'Linear sequence'}
+                </div>
                 <div className="font-mono text-[11px] text-[var(--muted)]">{total.toLocaleString()} bp</div>
               </div>
               <Field label="Name">
-                <Input value={plasmidName} onChange={e => setPlasmidName(e.target.value)} placeholder="pUC19" />
+                <Input value={plasmidName} onChange={e => setPlasmidName(e.target.value)} placeholder={isPlasmidView ? 'pUC19' : 'linear construct'} />
               </Field>
               <div>
                 <button
@@ -706,7 +876,7 @@ export default function PlasmidMapEditor() {
                     <TextArea
                       value={plasmidSeqRaw}
                       onChange={e => setPlasmidSeqRaw(e.target.value)}
-                      placeholder="Paste full plasmid sequence (ACGTN, whitespace OK)"
+                      placeholder="Paste sequence (ACGTN, whitespace OK)"
                       rows={5}
                       style={{ fontSize: 10, lineHeight: 1.4 }}
                     />
@@ -749,6 +919,104 @@ export default function PlasmidMapEditor() {
                 </div>
               </div>
 
+              {!isPlasmidView && (
+                <div className="space-y-2 pt-1 border-t border-[var(--border)]">
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Termini</div>
+                  <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
+                    <SegBtn active={linearTermini === 'none'} onClick={() => setLinearTermini('none')}>
+                      No termini
+                    </SegBtn>
+                    <SegBtn active={linearTermini === 'line'} onClick={() => setLinearTermini('line')}>
+                      Line
+                    </SegBtn>
+                    <SegBtn active={linearTermini === 'itr'} onClick={() => setLinearTermini('itr')}>
+                      ITR
+                    </SegBtn>
+                    <SegBtn active={linearTermini === 'break'} onClick={() => setLinearTermini('break')}>
+                      · · · //
+                    </SegBtn>
+                  </div>
+                  <div className="space-y-2 pt-2 border-t border-[var(--border)]">
+                    <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Termini labels</div>
+                    {['left', 'right'].map(side => (
+                      <div key={side}>
+                        {terminiLabels[side].visible ? (
+                          <div className="flex items-center gap-1.5">
+                            <Input
+                              value={terminiLabels[side].text}
+                              onChange={e => updateTerminiLabel(side, { text: e.target.value })}
+                              placeholder={`${side} label`}
+                            />
+                            <button
+                              onClick={() => updateTerminiLabel(side, { visible: false })}
+                              className="text-[var(--muted)] hover:text-[var(--accent)] p-1"
+                              title={`Remove ${side} terminus label`}
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => updateTerminiLabel(side, { visible: true })}
+                            className="w-full flex items-center justify-center gap-2 py-2 border border-dashed border-[var(--border-strong)] rounded-md text-[11px] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors uppercase tracking-wider"
+                          >
+                            <Plus size={12} /> Add {side} label
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                    <div>
+                      <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                        <span>Vertical distance</span>
+                        <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{terminiLabels.distance}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="4"
+                        max="80"
+                        step="1"
+                        value={terminiLabels.distance}
+                        onChange={e => updateTerminiLabels({ distance: parseInt(e.target.value) })}
+                        className="thickness-slider w-full"
+                      />
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                        <span>Label size</span>
+                        <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{terminiLabels.size ?? 12}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="7"
+                        max="24"
+                        step="1"
+                        value={terminiLabels.size ?? 12}
+                        onChange={e => updateTerminiLabels({ size: parseInt(e.target.value) })}
+                        className="thickness-slider w-full"
+                      />
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Label color</div>
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="color"
+                          value={terminiLabels.color || (textColor || theme.ink)}
+                          onChange={e => updateTerminiLabels({ color: e.target.value })}
+                          className="w-8 h-8 rounded border border-[var(--border)] cursor-pointer bg-[var(--bg)]"
+                          title={terminiLabels.color ? 'Custom label color' : 'Auto (text color)'}
+                        />
+                        <button
+                          onClick={() => updateTerminiLabels({ color: null })}
+                          className={`px-2 py-1 text-[10px] uppercase tracking-wider rounded border transition-colors ${terminiLabels.color === null ? 'border-[var(--ink)] bg-[var(--ink)] text-[var(--bg)]' : 'border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--ink)]'}`}
+                        >
+                          Auto
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Backbone thickness + color */}
               <div className="space-y-2 pt-1 border-t border-[var(--border)]">
                 <div>
@@ -789,59 +1057,63 @@ export default function PlasmidMapEditor() {
                 </div>
               </div>
 
-              {/* Rotation */}
-              <div className="pt-1 border-t border-[var(--border)]">
-                <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
-                  <span>Rotation</span>
-                  <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
-                    {rotation}°
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="range"
-                    min="0"
-                    max="360"
-                    step="1"
-                    value={rotation}
-                    onChange={e => setRotation(parseInt(e.target.value))}
-                    className="thickness-slider flex-1"
-                  />
-                  <button
-                    onClick={() => setRotation(0)}
-                    className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
-                  >
-                    reset
-                  </button>
-                </div>
-              </div>
+              {isPlasmidView && (
+                <>
+                  {/* Rotation */}
+                  <div className="pt-1 border-t border-[var(--border)]">
+                    <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                      <span>Rotation</span>
+                      <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                        {rotation}°
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range"
+                        min="0"
+                        max="360"
+                        step="1"
+                        value={rotation}
+                        onChange={e => setRotation(parseInt(e.target.value))}
+                        className="thickness-slider flex-1"
+                      />
+                      <button
+                        onClick={() => setRotation(0)}
+                        className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                      >
+                        reset
+                      </button>
+                    </div>
+                  </div>
 
-              {/* Plasmid radius */}
-              <div className="pt-1 border-t border-[var(--border)]">
-                <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
-                  <span>Plasmid radius</span>
-                  <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
-                    {radiusOffset > 0 ? '+' : ''}{radiusOffset}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="range"
-                    min="-100"
-                    max="150"
-                    step="2"
-                    value={radiusOffset}
-                    onChange={e => setRadiusOffset(parseInt(e.target.value))}
-                    className="thickness-slider flex-1"
-                  />
-                  <button
-                    onClick={() => setRadiusOffset(0)}
-                    className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
-                  >
-                    reset
-                  </button>
-                </div>
-              </div>
+                  {/* Plasmid radius */}
+                  <div className="pt-1 border-t border-[var(--border)]">
+                    <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                      <span>Plasmid radius</span>
+                      <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                        {radiusOffset > 0 ? '+' : ''}{radiusOffset}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range"
+                        min="-100"
+                        max="150"
+                        step="2"
+                        value={radiusOffset}
+                        onChange={e => setRadiusOffset(parseInt(e.target.value))}
+                        className="thickness-slider flex-1"
+                      />
+                      <button
+                        onClick={() => setRadiusOffset(0)}
+                        className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                      >
+                        reset
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
 
               {/* Typography */}
               <div className="pt-1 border-t border-[var(--border)] space-y-2">
@@ -870,18 +1142,22 @@ export default function PlasmidMapEditor() {
                     className="thickness-slider w-full" />
                 </div>
                 <div>
-                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
-                    <span>Tick label size</span>
-                    <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{tickFontSize.toFixed(1)}</span>
-                  </div>
-                  <input type="range" min="6" max="14" step="0.5"
-                    value={tickFontSize}
-                    onChange={e => setTickFontSize(parseFloat(e.target.value))}
-                    className="thickness-slider w-full" />
+                  {showTicks && (
+                    <>
+                      <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                        <span>Tick label size</span>
+                        <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{tickFontSize.toFixed(1)}</span>
+                      </div>
+                      <input type="range" min="6" max="14" step="0.5"
+                        value={tickFontSize}
+                        onChange={e => setTickFontSize(parseFloat(e.target.value))}
+                        className="thickness-slider w-full" />
+                    </>
+                  )}
                 </div>
                 <div>
                   <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
-                    <span>Plasmid name size</span>
+                    <span>{isPlasmidView ? 'Plasmid name size' : 'Sequence name size'}</span>
                     <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{nameFontSize}</span>
                   </div>
                   <input type="range" min="14" max="56" step="1"
@@ -889,6 +1165,18 @@ export default function PlasmidMapEditor() {
                     onChange={e => setNameFontSize(parseInt(e.target.value))}
                     className="thickness-slider w-full" />
                 </div>
+                {!isPlasmidView && (showName || showSize) && (
+                  <div>
+                    <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                      <span>Name + size vertical distance</span>
+                      <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">{linearTitleDistance}</span>
+                    </div>
+                    <input type="range" min="90" max="330" step="1"
+                      value={linearTitleDistance}
+                      onChange={e => setLinearTitleDistance(parseInt(e.target.value))}
+                      className="thickness-slider w-full" />
+                  </div>
+                )}
                 <div>
                   <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Text color</div>
                   <div className="flex items-center gap-1.5">
@@ -915,7 +1203,7 @@ export default function PlasmidMapEditor() {
                   className="flex items-center gap-2 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
                 >
                   {showName ? <Eye size={12} /> : <EyeOff size={12} />}
-                  Plasmid name {showName ? 'visible' : 'hidden'}
+                  {isPlasmidView ? 'Plasmid' : 'Sequence'} name {showName ? 'visible' : 'hidden'}
                 </button>
                 <button
                   onClick={() => setShowSize(v => !v)}
@@ -923,6 +1211,13 @@ export default function PlasmidMapEditor() {
                 >
                   {showSize ? <Eye size={12} /> : <EyeOff size={12} />}
                   Size label {showSize ? 'visible' : 'hidden'}
+                </button>
+                <button
+                  onClick={() => setShowTicks(v => !v)}
+                  className="flex items-center gap-2 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+                >
+                  {showTicks ? <Eye size={12} /> : <EyeOff size={12} />}
+                  Ticks {showTicks ? 'visible' : 'hidden'}
                 </button>
               </div>
             </div>
@@ -940,6 +1235,7 @@ export default function PlasmidMapEditor() {
                   key={ann.id}
                   ann={ann}
                   total={total}
+                  viewMode={activeView}
                   onUpdate={(u) => updateAnn(ann.id, u)}
                   onRemove={() => removeAnn(ann.id)}
                   onHover={setHoveredId}
@@ -976,6 +1272,7 @@ export default function PlasmidMapEditor() {
                   key={hl.id}
                   hl={hl}
                   total={total}
+                  viewMode={activeView}
                   onUpdate={(u) => updateHighlight(hl.id, u)}
                   onRemove={() => removeHighlight(hl.id)}
                 />
@@ -1002,61 +1299,156 @@ export default function PlasmidMapEditor() {
           className="flex-1 flex items-center justify-center min-h-0 p-6 relative overflow-hidden transition-colors"
           style={{ background: theme.bg }}
         >
-          <div className="w-full h-full max-w-[800px] max-h-[800px] aspect-square">
-            <svg
-              ref={svgRef}
-              viewBox={`-${VIEWBOX/2} -${VIEWBOX/2} ${VIEWBOX} ${VIEWBOX}`}
-              className="w-full h-full"
-              style={{ overflow: 'visible', fontFamily }}
-            >
-              {/* Background — included in export */}
-              <rect
-                x={-VIEWBOX/2} y={-VIEWBOX/2}
-                width={VIEWBOX} height={VIEWBOX}
-                fill={theme.bg}
-              />
+          {isPlasmidView ? (
+            <div className="w-full h-full max-w-[800px] max-h-[800px] aspect-square">
+              <svg
+                ref={svgRef}
+                viewBox={`-${VIEWBOX/2} -${VIEWBOX/2} ${VIEWBOX} ${VIEWBOX}`}
+                className="w-full h-full"
+                style={{ overflow: 'visible', fontFamily }}
+              >
+                {/* Background — included in export */}
+                <rect
+                  x={-VIEWBOX/2} y={-VIEWBOX/2}
+                  width={VIEWBOX} height={VIEWBOX}
+                  fill={theme.bg}
+                />
 
-              {/* Rotating ring — highlights, backbone, ticks, annotations all rotate together; center labels stay static */}
-              <g transform={`rotate(${rotation})`}>
-                {/* Highlights — translucent bands; rendered FIRST so they sit at the very back, behind the plasmid ring itself */}
+                {/* Rotating ring — highlights, backbone, ticks, annotations all rotate together; center labels stay static */}
+                <g transform={`rotate(${rotation})`}>
+                  {/* Highlights — translucent bands; rendered FIRST so they sit at the very back, behind the plasmid ring itself */}
+                  {resolvedHighlights.filter(h => h.found).map(hl => (
+                    <Highlight
+                      key={hl.id}
+                      hl={hl}
+                      total={total}
+                      rotation={rotation}
+                      fontFamily={fontFamily}
+                      textColor={textColor}
+                      currentR={currentR}
+                    />
+                  ))}
+
+                  {/* Backbone */}
+                  <circle
+                    cx="0" cy="0" r={currentR}
+                    fill="none"
+                    stroke={backboneColor || theme.backbone}
+                    strokeWidth={backboneThickness}
+                  />
+
+                  {/* Ticks */}
+                  {showTicks && ticks.map((t) => (
+                    <g key={t.p}>
+                      <line
+                        x1={t.x1} y1={t.y1} x2={t.x2} y2={t.y2}
+                        stroke={theme.backbone}
+                        strokeWidth="0.8"
+                        opacity="0.55"
+                      />
+                      <text
+                        x={t.tx} y={t.ty}
+                        fontSize={tickFontSize}
+                        fill={theme.muted}
+                        textAnchor="middle"
+                        dominantBaseline="middle"
+                        transform={`rotate(${-rotation} ${t.tx} ${t.ty})`}
+                        style={{ fontFamily, letterSpacing: '0.02em' }}
+                      >
+                        {t.p}
+                      </text>
+                    </g>
+                  ))}
+
+                  {/* Annotations — rendered on top */}
+                  {resolved.filter(a => a.found).map(ann => (
+                    <Annotation
+                      key={ann.id}
+                      ann={ann}
+                      total={total}
+                      isHovered={hoveredId === ann.id}
+                      onHover={setHoveredId}
+                      theme={theme}
+                      labelStack={labelLayout[ann.id] || 0}
+                      rotation={rotation}
+                      fontFamily={fontFamily}
+                      labelFontSize={labelFontSize}
+                      textColor={textColor}
+                      currentR={currentR}
+                    />
+                  ))}
+                </g>
+
+                {/* Center labels — static, do not rotate */}
+                {showName && (
+                  <text x="0" y={showSize ? -8 : 6} textAnchor="middle" fontSize={nameFontSize} fill={textColor || theme.ink} style={{ fontFamily, fontStyle: 'italic' }}>
+                    {plasmidName || 'untitled'}
+                  </text>
+                )}
+                {showSize && (
+                  <text x="0" y={showName ? 18 : 6} textAnchor="middle" fontSize="11" fill={theme.muted} style={{ fontFamily, letterSpacing: '0.05em' }}>
+                    {total.toLocaleString()} bp
+                  </text>
+                )}
+              </svg>
+            </div>
+          ) : (
+            <div className="w-full h-full max-w-[980px] max-h-[620px] aspect-[820/520]">
+              <svg
+                ref={svgRef}
+                viewBox={`-${LINEAR_VIEWBOX_W/2} -${LINEAR_VIEWBOX_H/2} ${LINEAR_VIEWBOX_W} ${LINEAR_VIEWBOX_H}`}
+                className="w-full h-full"
+                style={{ overflow: 'visible', fontFamily }}
+              >
+                <rect
+                  x={-LINEAR_VIEWBOX_W/2} y={-LINEAR_VIEWBOX_H/2}
+                  width={LINEAR_VIEWBOX_W} height={LINEAR_VIEWBOX_H}
+                  fill={theme.bg}
+                />
+
+                <LinearTermini
+                  terminiStyle={linearTermini}
+                  backboneColor={backboneColor || theme.backbone}
+                  backboneThickness={backboneThickness}
+                  labels={terminiLabels}
+                  fontFamily={fontFamily}
+                  textColor={textColor || theme.ink}
+                />
+
                 {resolvedHighlights.filter(h => h.found).map(hl => (
-                  <Highlight
+                  <LinearHighlight
                     key={hl.id}
                     hl={hl}
                     total={total}
-                    theme={theme}
-                    rotation={rotation}
                     fontFamily={fontFamily}
                     textColor={textColor}
-                    currentR={currentR}
                   />
                 ))}
 
-                {/* Backbone */}
-                <circle
-                  cx="0" cy="0" r={currentR}
-                  fill="none"
+                <line
+                  x1={LINEAR_SEQ_LEFT}
+                  y1={LINEAR_SEQ_Y}
+                  x2={LINEAR_SEQ_RIGHT}
+                  y2={LINEAR_SEQ_Y}
                   stroke={backboneColor || theme.backbone}
                   strokeWidth={backboneThickness}
-                  opacity="0.85"
-                />
+                  strokeLinecap={linearTermini === 'line' || linearTermini === 'break' ? 'round' : 'butt'}
+                  />
 
-                {/* Ticks */}
-                {ticks.map((t) => (
+                {showTicks && linearTicks.map(t => (
                   <g key={t.p}>
                     <line
-                      x1={t.x1} y1={t.y1} x2={t.x2} y2={t.y2}
+                      x1={t.x} y1={LINEAR_SEQ_Y + 8} x2={t.x} y2={LINEAR_SEQ_Y + 17}
                       stroke={theme.backbone}
                       strokeWidth="0.8"
                       opacity="0.55"
                     />
                     <text
-                      x={t.tx} y={t.ty}
+                      x={t.x} y={LINEAR_SEQ_Y + 33}
                       fontSize={tickFontSize}
                       fill={theme.muted}
                       textAnchor="middle"
                       dominantBaseline="middle"
-                      transform={`rotate(${-rotation} ${t.tx} ${t.ty})`}
                       style={{ fontFamily, letterSpacing: '0.02em' }}
                     >
                       {t.p}
@@ -1064,38 +1456,43 @@ export default function PlasmidMapEditor() {
                   </g>
                 ))}
 
-                {/* Annotations — rendered on top */}
                 {resolved.filter(a => a.found).map(ann => (
-                  <Annotation
+                  <LinearAnnotation
                     key={ann.id}
                     ann={ann}
                     total={total}
                     isHovered={hoveredId === ann.id}
                     onHover={setHoveredId}
                     theme={theme}
-                    labelStack={labelLayout[ann.id] || 0}
-                    rotation={rotation}
+                    labelStack={linearLabelLayout[ann.id] || 0}
                     fontFamily={fontFamily}
                     labelFontSize={labelFontSize}
                     textColor={textColor}
-                    currentR={currentR}
                   />
                 ))}
-              </g>
 
-              {/* Center labels — static, do not rotate */}
-              {showName && (
-                <text x="0" y={showSize ? -8 : 6} textAnchor="middle" fontSize={nameFontSize} fill={textColor || theme.ink} style={{ fontFamily, fontStyle: 'italic' }}>
-                  {plasmidName || 'untitled'}
-                </text>
-              )}
-              {showSize && (
-                <text x="0" y={showName ? 18 : 6} textAnchor="middle" fontSize="11" fill={theme.muted} style={{ fontFamily, letterSpacing: '0.05em' }}>
-                  {total.toLocaleString()} bp
-                </text>
-              )}
-            </svg>
-          </div>
+                {(() => {
+                  const titleCenterY = LINEAR_SEQ_Y - linearTitleDistance;
+                  const nameY = showName && showSize ? titleCenterY - 14 : titleCenterY;
+                  const sizeY = showName && showSize ? titleCenterY + 14 : titleCenterY;
+                  return (
+                    <>
+                      {showName && (
+                        <text x="0" y={nameY} textAnchor="middle" fontSize={nameFontSize} fill={textColor || theme.ink} style={{ fontFamily, fontStyle: 'italic' }}>
+                          {plasmidName || 'untitled'}
+                        </text>
+                      )}
+                      {showSize && (
+                        <text x="0" y={sizeY} textAnchor="middle" fontSize="11" fill={theme.muted} style={{ fontFamily, letterSpacing: '0.05em' }}>
+                          {total.toLocaleString()} bp
+                        </text>
+                      )}
+                    </>
+                  );
+                })()}
+              </svg>
+            </div>
+          )}
         </main>
       </div>
     </div>
@@ -1107,11 +1504,12 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
   const { a1, a2 } = computeAngles(ann.start, ann.end, total);
   const sizeScale = ann.sizeScale ?? 1;
   const thickness = BAND_THICKNESS * sizeScale;
+  const lineStroke = 3.5 * sizeScale;
   const { inner, outer } = ringRadii(ann.ring, thickness, currentR);
   const cornerRadius = thickness * 0.35; // proportional rounding
   const cornerStyle = ann.cornerStyle ?? 'rounded';
   const outlineColor = ann.outlineColor || darken(ann.color, 0.5);
-  const outlineWidth = 1.3;
+  const outlineWidth = ann.outlineWidth ?? DEFAULT_ANNOTATION_OUTLINE_WIDTH;
   let pathEl;
   if (ann.shape === 'arrow') {
     const d = cornerStyle === 'rounded'
@@ -1154,13 +1552,12 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
   } else {
     // line — stroke width scales with sizeScale, already round caps
     const midR = (inner + outer) / 2;
-    const baseStroke = 3.5 * sizeScale;
     pathEl = (
       <path
         d={linePath(a1, a2, midR)}
         fill="none"
         stroke={ann.color}
-        strokeWidth={isHovered ? baseStroke + 1 : baseStroke}
+        strokeWidth={isHovered ? lineStroke + 1 : lineStroke}
         strokeLinecap="round"
         opacity={1}
         className={isHovered ? 'annotation-hover' : ''}
@@ -1178,10 +1575,17 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
     // between its termini; 0 = center.
     const sweep = a2 - a1;
     const labelA = a1 + sweep * (0.5 + (ann.labelPosition ?? 0) / 100);
-    const labelR = outer + LABEL_OFFSET + labelStack * 16 + (ann.labelDistance ?? 0);
+    const isInnerRing = (ann.ring ?? 0) < 0;
+    const labelGap = LABEL_OFFSET + labelStack * 16 + (ann.labelDistance ?? 0);
+    const labelR = isInnerRing
+      ? Math.max(4, inner - labelGap)
+      : outer + labelGap;
     const [lx, ly] = polar(labelA, labelR);
-    const [lineStartX, lineStartY] = polar(labelA, outer + 2);
-    const [lineEndX, lineEndY] = polar(labelA, labelR - 4);
+    const leaderStartR = ann.shape === 'line'
+      ? (inner + outer) / 2 + (isInnerRing ? -1 : 1) * (lineStroke / 2 + 2)
+      : (isInnerRing ? Math.max(4, inner - 2) : outer + 2);
+    const [lineStartX, lineStartY] = polar(labelA, Math.max(4, leaderStartR));
+    const [lineEndX, lineEndY] = polar(labelA, isInnerRing ? labelR + 4 : labelR - 4);
     // Anchor based on screen-space angle (after rotation), so labels still
     // extend outward from the circle even when ring is rotated.
     const screenA = labelA + (rotation * Math.PI) / 180;
@@ -1214,7 +1618,7 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
 }
 
 /* ---------- highlight: translucent band with curved label ---------- */
-function Highlight({ hl, total, theme, fontFamily, textColor, rotation = 0, currentR = R_DEFAULT }) {
+function Highlight({ hl, total, fontFamily, textColor, rotation = 0, currentR = R_DEFAULT }) {
   const { a1, a2 } = computeAngles(hl.start, hl.end, total);
   const sizeScale = hl.sizeScale ?? 3;
   const thickness = BAND_THICKNESS * sizeScale;
@@ -1224,6 +1628,7 @@ function Highlight({ hl, total, theme, fontFamily, textColor, rotation = 0, curr
   const cornerRadius = thickness * 0.2;
   const opacity = hl.opacity ?? 0.25;
   const labelSize = hl.labelSize ?? 13;
+  const isInnerRing = (hl.ring ?? 1) < 0;
 
   const bandD = cornerStyle === 'rounded'
     ? roundedBandPath(a1, a2, inner, outer, cornerRadius)
@@ -1232,7 +1637,7 @@ function Highlight({ hl, total, theme, fontFamily, textColor, rotation = 0, curr
   // Path for the curved label — by default sits on the band's midline, but
   // labelDistance lets the user push it outward (positive) or pull it inward
   // (negative) of the band.
-  const labelR = midR + (hl.labelDistance ?? 0);
+  const labelR = Math.max(4, midR + (isInnerRing ? -1 : 1) * (hl.labelDistance ?? 0));
   const sweep = a2 - a1;
   const largeArc = sweep > Math.PI ? 1 : 0;
   const [px1, py1] = polar(a1, labelR);
@@ -1246,10 +1651,12 @@ function Highlight({ hl, total, theme, fontFamily, textColor, rotation = 0, curr
 
   // Boundary dashed lines at start/end (extending from outer edge inward toward backbone)
   const boundaryEls = hl.showBoundaries ? (() => {
-    const [b1ox, b1oy] = polar(a1, outer + 4);
-    const [b1ix, b1iy] = polar(a1, currentR - 6);
-    const [b2ox, b2oy] = polar(a2, outer + 4);
-    const [b2ix, b2iy] = polar(a2, currentR - 6);
+    const boundaryOuterR = isInnerRing ? Math.max(4, inner - 4) : outer + 4;
+    const boundaryInnerR = isInnerRing ? currentR + 6 : currentR - 6;
+    const [b1ox, b1oy] = polar(a1, boundaryOuterR);
+    const [b1ix, b1iy] = polar(a1, boundaryInnerR);
+    const [b2ox, b2oy] = polar(a2, boundaryOuterR);
+    const [b2ix, b2iy] = polar(a2, boundaryInnerR);
     return (
       <g>
         <line x1={b1ox} y1={b1oy} x2={b1ix} y2={b1iy}
@@ -1262,8 +1669,9 @@ function Highlight({ hl, total, theme, fontFamily, textColor, rotation = 0, curr
 
   // Boundary position labels (tinted to match highlight) — counter-rotated upright
   const boundaryLabels = hl.showBoundaries ? (() => {
-    const [t1x, t1y] = polar(a1, outer + 14);
-    const [t2x, t2y] = polar(a2, outer + 14);
+    const boundaryLabelR = isInnerRing ? Math.max(4, inner - 14) : outer + 14;
+    const [t1x, t1y] = polar(a1, boundaryLabelR);
+    const [t2x, t2y] = polar(a2, boundaryLabelR);
     return (
       <g>
         <text x={t1x} y={t1y} textAnchor="middle" dominantBaseline="middle"
@@ -1320,9 +1728,348 @@ function Highlight({ hl, total, theme, fontFamily, textColor, rotation = 0, curr
   );
 }
 
+/* ---------- linear map drawing ---------- */
+function BrokenTerminusMarker({ x, flip = false, color, strokeWidth, dotRadius }) {
+  const slashHalfH = 8;
+  const slashLean = 4.5;
+  const dotOffsets = [-17, -11, -5];
+  const slashOffsets = [7, 14];
+  const dots = flip ? dotOffsets.map(v => -v) : dotOffsets;
+  const slashes = flip ? slashOffsets.map(v => -v) : slashOffsets;
+
+  return (
+    <g>
+      {dots.map(dx => (
+        <circle
+          key={`dot-${dx}`}
+          cx={x + dx}
+          cy={LINEAR_SEQ_Y}
+          r={dotRadius}
+          fill={color}
+        />
+      ))}
+      {slashes.map(dx => (
+        <line
+          key={`slash-${dx}`}
+          x1={x + dx - slashLean / 2}
+          y1={LINEAR_SEQ_Y + slashHalfH}
+          x2={x + dx + slashLean / 2}
+          y2={LINEAR_SEQ_Y - slashHalfH}
+          stroke={color}
+          strokeWidth={strokeWidth}
+          strokeLinecap="round"
+        />
+      ))}
+    </g>
+  );
+}
+
+function LinearTermini({ terminiStyle, backboneColor, backboneThickness, labels, fontFamily, textColor }) {
+  let terminiEl = null;
+  let leftLabelX = LINEAR_SEQ_LEFT;
+  let rightLabelX = LINEAR_SEQ_RIGHT;
+  let labelTopY = LINEAR_SEQ_Y;
+
+  if (terminiStyle === 'line') {
+    leftLabelX = LINEAR_SEQ_LEFT - LINEAR_TERMINUS_EXT / 2;
+    rightLabelX = LINEAR_SEQ_RIGHT + LINEAR_TERMINUS_EXT / 2;
+    terminiEl = (
+      <g>
+        <line
+          x1={LINEAR_SEQ_LEFT - LINEAR_TERMINUS_EXT}
+          y1={LINEAR_SEQ_Y}
+          x2={LINEAR_SEQ_LEFT}
+          y2={LINEAR_SEQ_Y}
+          stroke={backboneColor}
+          strokeWidth={backboneThickness}
+          strokeLinecap="round"
+        />
+        <line
+          x1={LINEAR_SEQ_RIGHT}
+          y1={LINEAR_SEQ_Y}
+          x2={LINEAR_SEQ_RIGHT + LINEAR_TERMINUS_EXT}
+          y2={LINEAR_SEQ_Y}
+          stroke={backboneColor}
+          strokeWidth={backboneThickness}
+          strokeLinecap="round"
+        />
+      </g>
+    );
+  } else if (terminiStyle === 'break') {
+    const markerOffset = 28;
+    const slashStroke = backboneThickness;
+    const dotR = slashStroke * 0.75;
+    leftLabelX = LINEAR_SEQ_LEFT - markerOffset;
+    rightLabelX = LINEAR_SEQ_RIGHT + markerOffset;
+    labelTopY = LINEAR_SEQ_Y - 8;
+    terminiEl = (
+      <g>
+        <BrokenTerminusMarker x={leftLabelX} color={backboneColor} strokeWidth={slashStroke} dotRadius={dotR} />
+        <BrokenTerminusMarker x={rightLabelX} flip color={backboneColor} strokeWidth={slashStroke} dotRadius={dotR} />
+      </g>
+    );
+  } else if (terminiStyle === 'itr') {
+    const loopW = 34;
+    const loopH = 84;
+    const loopR = 11;
+    const stem = 26;
+    const pairEndGap = 6;
+    const pairGap = 14;
+    const pairY = LINEAR_SEQ_Y - pairGap;
+    const loopCenterY = (LINEAR_SEQ_Y + pairY) / 2;
+    const leftInnerX = LINEAR_SEQ_LEFT - stem;
+    const leftOuterX = leftInnerX - loopW;
+    const rightInnerX = LINEAR_SEQ_RIGHT + stem;
+    const rightOuterX = rightInnerX + loopW;
+    const topY = loopCenterY - loopH / 2;
+    const bottomY = loopCenterY + loopH / 2;
+    leftLabelX = (leftOuterX + leftInnerX) / 2;
+    rightLabelX = (rightOuterX + rightInnerX) / 2;
+    labelTopY = topY;
+    const leftD = [
+      `M ${LINEAR_SEQ_LEFT} ${LINEAR_SEQ_Y}`,
+      `L ${leftInnerX} ${LINEAR_SEQ_Y}`,
+      `L ${leftInnerX} ${bottomY - loopR}`,
+      `Q ${leftInnerX} ${bottomY} ${leftInnerX - loopR} ${bottomY}`,
+      `L ${leftOuterX + loopR} ${bottomY}`,
+      `Q ${leftOuterX} ${bottomY} ${leftOuterX} ${bottomY - loopR}`,
+      `L ${leftOuterX} ${topY + loopR}`,
+      `Q ${leftOuterX} ${topY} ${leftOuterX + loopR} ${topY}`,
+      `L ${leftInnerX - loopR} ${topY}`,
+      `Q ${leftInnerX} ${topY} ${leftInnerX} ${topY + loopR}`,
+      `L ${leftInnerX} ${pairY}`,
+      `L ${LINEAR_SEQ_LEFT - pairEndGap} ${pairY}`,
+    ].join(' ');
+    const rightD = [
+      `M ${LINEAR_SEQ_RIGHT} ${LINEAR_SEQ_Y}`,
+      `L ${rightInnerX} ${LINEAR_SEQ_Y}`,
+      `L ${rightInnerX} ${bottomY - loopR}`,
+      `Q ${rightInnerX} ${bottomY} ${rightInnerX + loopR} ${bottomY}`,
+      `L ${rightOuterX - loopR} ${bottomY}`,
+      `Q ${rightOuterX} ${bottomY} ${rightOuterX} ${bottomY - loopR}`,
+      `L ${rightOuterX} ${topY + loopR}`,
+      `Q ${rightOuterX} ${topY} ${rightOuterX - loopR} ${topY}`,
+      `L ${rightInnerX + loopR} ${topY}`,
+      `Q ${rightInnerX} ${topY} ${rightInnerX} ${topY + loopR}`,
+      `L ${rightInnerX} ${pairY}`,
+      `L ${LINEAR_SEQ_RIGHT + pairEndGap} ${pairY}`,
+    ].join(' ');
+    terminiEl = (
+      <g fill="none" stroke={backboneColor} strokeWidth={backboneThickness} strokeLinecap="round" strokeLinejoin="round">
+        <path d={leftD} />
+        <path d={rightD} />
+      </g>
+    );
+  }
+
+  const labelColor = labels?.color || textColor || backboneColor;
+  const labelY = labelTopY - (labels?.distance ?? 22);
+
+  return (
+    <g>
+      {terminiEl}
+      {labels?.left?.visible && (
+        <text
+          x={leftLabelX}
+          y={labelY}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          fontSize={labels?.size ?? 12}
+          fill={labelColor}
+          style={{ fontFamily, letterSpacing: '0.02em' }}
+        >
+          {labels.left.text}
+        </text>
+      )}
+      {labels?.right?.visible && (
+        <text
+          x={rightLabelX}
+          y={labelY}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          fontSize={labels?.size ?? 12}
+          fill={labelColor}
+          style={{ fontFamily, letterSpacing: '0.02em' }}
+        >
+          {labels.right.text}
+        </text>
+      )}
+    </g>
+  );
+}
+
+function LinearAnnotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fontFamily, labelFontSize = 11.5, textColor }) {
+  const { x1, x2 } = linearRangeX(ann.start, ann.end, total);
+  const sizeScale = ann.sizeScale ?? 1;
+  const thickness = BAND_THICKNESS * sizeScale;
+  const lineStroke = 3.5 * sizeScale;
+  const y = linearTrackY(ann.ring ?? 0);
+  const cornerRadius = thickness * 0.35;
+  const cornerStyle = ann.cornerStyle ?? 'rounded';
+  const outlineColor = ann.outlineColor || darken(ann.color, 0.5);
+  const outlineWidth = ann.outlineWidth ?? DEFAULT_ANNOTATION_OUTLINE_WIDTH;
+
+  let pathEl;
+  if (ann.shape === 'arrow') {
+    pathEl = (
+      <path
+        d={linearArrowPath(x1, x2, y, thickness, ann.direction, cornerStyle, cornerRadius)}
+        fill={ann.color}
+        stroke={outlineColor}
+        strokeWidth={outlineWidth}
+        strokeLinejoin={cornerStyle === 'rounded' ? 'round' : 'miter'}
+        strokeLinecap={cornerStyle === 'rounded' ? 'round' : 'butt'}
+        className={isHovered ? 'annotation-hover' : ''}
+        style={{ transition: 'filter 0.15s, opacity 0.15s' }}
+        onMouseEnter={() => onHover(ann.id)}
+        onMouseLeave={() => onHover(null)}
+      />
+    );
+  } else if (ann.shape === 'block') {
+    pathEl = (
+      <path
+        d={linearBlockPath(x1, x2, y, thickness, cornerStyle, cornerRadius)}
+        fill={ann.color}
+        stroke={outlineColor}
+        strokeWidth={outlineWidth}
+        strokeLinejoin={cornerStyle === 'rounded' ? 'round' : 'miter'}
+        strokeLinecap={cornerStyle === 'rounded' ? 'round' : 'butt'}
+        className={isHovered ? 'annotation-hover' : ''}
+        style={{ transition: 'filter 0.15s, opacity 0.15s' }}
+        onMouseEnter={() => onHover(ann.id)}
+        onMouseLeave={() => onHover(null)}
+      />
+    );
+  } else {
+    pathEl = (
+      <line
+        x1={x1}
+        y1={y}
+        x2={x2}
+        y2={y}
+        stroke={ann.color}
+        strokeWidth={isHovered ? lineStroke + 1 : lineStroke}
+        strokeLinecap="round"
+        className={isHovered ? 'annotation-hover' : ''}
+        style={{ transition: 'all 0.15s' }}
+        onMouseEnter={() => onHover(ann.id)}
+        onMouseLeave={() => onHover(null)}
+      />
+    );
+  }
+
+  let labelEl = null;
+  if (ann.showLabel) {
+    const labelX = x1 + (x2 - x1) * (0.5 + (ann.labelPosition ?? 0) / 100);
+    const track = ann.ring ?? 0;
+    const side = track < 0 ? 1 : -1;
+    const visibleHalfThickness = ann.shape === 'line' ? lineStroke / 2 : thickness / 2;
+    const labelY = y + side * (visibleHalfThickness + LABEL_OFFSET + labelStack * 16 + (ann.labelDistance ?? 0));
+    const lineStartY = y + side * (visibleHalfThickness + 2);
+    const lineEndY = labelY - side * 8;
+    labelEl = (
+      <g style={{ pointerEvents: 'none' }}>
+        <line
+          x1={labelX} y1={lineStartY} x2={labelX} y2={lineEndY}
+          stroke={theme.backbone} strokeWidth="0.6" opacity="0.55"
+        />
+        <text
+          x={labelX} y={labelY}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          fontSize={labelFontSize}
+          fill={textColor || theme.ink}
+          style={{ fontFamily, fontWeight: 500, letterSpacing: '0.01em' }}
+        >
+          {ann.name}
+        </text>
+      </g>
+    );
+  }
+
+  return <g>{pathEl}{labelEl}</g>;
+}
+
+function LinearHighlight({ hl, total, fontFamily, textColor }) {
+  const { x1, x2 } = linearRangeX(hl.start, hl.end, total);
+  const sizeScale = hl.sizeScale ?? 3;
+  const thickness = BAND_THICKNESS * sizeScale;
+  const y = linearTrackY(hl.ring ?? 1);
+  const cornerStyle = hl.cornerStyle ?? 'rounded';
+  const cornerRadius = thickness * 0.2;
+  const opacity = hl.opacity ?? 0.25;
+  const labelSize = hl.labelSize ?? 13;
+  const track = hl.ring ?? 1;
+  const side = track < 0 ? 1 : -1;
+  const boundaryBandY = y + side * (thickness / 2 + 4);
+  const boundaryLabelY = y + side * (thickness / 2 + 12);
+
+  const boundaryEls = hl.showBoundaries ? (
+    <g>
+      <line
+        x1={x1} y1={boundaryBandY}
+        x2={x1} y2={LINEAR_SEQ_Y + 22}
+        stroke={hl.color} strokeWidth="1" strokeDasharray="3 3" opacity="0.7"
+      />
+      <line
+        x1={x2} y1={boundaryBandY}
+        x2={x2} y2={LINEAR_SEQ_Y + 22}
+        stroke={hl.color} strokeWidth="1" strokeDasharray="3 3" opacity="0.7"
+      />
+    </g>
+  ) : null;
+
+  const boundaryLabels = hl.showBoundaries ? (
+    <g>
+      <text x={x1} y={boundaryLabelY} textAnchor="middle" dominantBaseline="middle"
+        fontSize="10" fill={hl.color}
+        style={{ fontFamily, fontWeight: 600, letterSpacing: '0.02em' }}>
+        {hl.start}
+      </text>
+      <text x={x2} y={boundaryLabelY} textAnchor="middle" dominantBaseline="middle"
+        fontSize="10" fill={hl.color}
+        style={{ fontFamily, fontWeight: 600, letterSpacing: '0.02em' }}>
+        {hl.end}
+      </text>
+    </g>
+  ) : null;
+
+  const labelX = x1 + (x2 - x1) * (0.5 + (hl.labelOffset ?? 0) / 100);
+  const labelY = y + side * (hl.labelDistance ?? 0);
+
+  return (
+    <g style={{ pointerEvents: 'none' }}>
+      <path
+        d={linearBlockPath(x1, x2, y, thickness, cornerStyle, cornerRadius)}
+        fill={hl.color}
+        stroke={hl.color}
+        strokeWidth="0.5"
+        strokeOpacity={Math.min(1, opacity * 2.5)}
+        fillOpacity={opacity}
+      />
+      {boundaryEls}
+      {boundaryLabels}
+      {hl.showLabel !== false && (
+        <text
+          x={labelX}
+          y={labelY}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          fontSize={labelSize}
+          fill={textColor || hl.color}
+          style={{ fontFamily, fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}
+        >
+          {hl.name}
+        </text>
+      )}
+    </g>
+  );
+}
+
 /* ---------- annotation card in the panel ---------- */
-function AnnotationCard({ ann, total, onUpdate, onRemove, onHover, isHovered }) {
+function AnnotationCard({ ann, total, viewMode, onUpdate, onRemove, onHover, isHovered }) {
   const collapsed = ann.collapsed;
+  const isLinear = viewMode === 'linear';
   return (
     <div
       onMouseEnter={() => onHover(ann.id)}
@@ -1337,7 +2084,7 @@ function AnnotationCard({ ann, total, onUpdate, onRemove, onHover, isHovered }) 
         />
         <div className="flex-1 text-[13px] font-medium truncate">{ann.name || <span className="italic text-[var(--muted)]">unnamed</span>}</div>
         <div className="text-[9px] uppercase tracking-wider text-[var(--muted)] font-mono">
-          R{ann.ring}
+          {isLinear ? 'T' : 'R'}{ann.ring}
         </div>
         {!ann.found && (
           <AlertCircle size={12} className="text-[var(--accent)]" />
@@ -1366,7 +2113,7 @@ function AnnotationCard({ ann, total, onUpdate, onRemove, onHover, isHovered }) 
               <SegBtn
                 active={ann.mode === 'sequence'}
                 onClick={() => onUpdate({ mode: 'sequence' })}
-                title="Search subsequence in plasmid"
+                title="Search subsequence"
               >
                 <Search size={11} /> Sequence
               </SegBtn>
@@ -1472,20 +2219,26 @@ function AnnotationCard({ ann, total, onUpdate, onRemove, onHover, isHovered }) 
 
           {/* Ring */}
           <div>
-            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Ring</div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">
+              {isLinear ? 'Track' : 'Ring'}
+            </div>
             <div className="flex items-center border border-[var(--border)] rounded-md overflow-hidden bg-[var(--bg)] max-w-[140px]">
               <button
-                onClick={() => onUpdate({ ring: Math.max(0, ann.ring - 1) })}
+                onClick={() => onUpdate({ ring: Math.max(trackMin(isLinear), (ann.ring ?? 0) - 1) })}
                 className="px-2 py-1.5 text-[var(--muted)] hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors"
               >−</button>
-              <div className="flex-1 text-center font-mono text-[12px]">{ann.ring}</div>
+              <div className="flex-1 text-center font-mono text-[12px]">{ann.ring ?? 0}</div>
               <button
-                onClick={() => onUpdate({ ring: Math.min(8, ann.ring + 1) })}
+                onClick={() => onUpdate({ ring: Math.min(trackMax(isLinear), (ann.ring ?? 0) + 1) })}
                 className="px-2 py-1.5 text-[var(--muted)] hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors"
               >+</button>
             </div>
             <div className="text-[9.5px] text-[var(--muted)] mt-1 italic">
-              {ann.ring === 0 ? 'on backbone' : `ring ${ann.ring} outward`}
+              {(ann.ring ?? 0) === 0
+                ? 'on backbone'
+                : isLinear
+                  ? `track ${ann.ring} ${ann.ring > 0 ? 'above' : 'below'}`
+                  : `ring ${ann.ring} ${ann.ring > 0 ? 'outward' : 'inward'}`}
             </div>
           </div>
 
@@ -1524,7 +2277,9 @@ function AnnotationCard({ ann, total, onUpdate, onRemove, onHover, isHovered }) 
 
           {/* Fill color */}
           <div>
-            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Fill</div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">
+              {ann.shape === 'line' ? 'Line color' : 'Fill'}
+            </div>
             <div className="flex items-start gap-1.5">
               <input
                 type="color"
@@ -1560,37 +2315,65 @@ function AnnotationCard({ ann, total, onUpdate, onRemove, onHover, isHovered }) 
           </div>
 
           {/* Outline color */}
-          <div>
-            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Outline</div>
-            <div className="flex items-center gap-1.5">
-              <input
-                type="color"
-                value={ann.outlineColor || darken(ann.color, 0.5)}
-                onChange={e => onUpdate({ outlineColor: e.target.value })}
-                className="w-8 h-8 rounded border border-[var(--border)] cursor-pointer bg-[var(--bg)]"
-                title={ann.outlineColor ? 'Custom outline color' : 'Auto (darkened fill)'}
-              />
-              <button
-                onClick={() => onUpdate({ outlineColor: null })}
-                className={`px-2 py-1 text-[10px] uppercase tracking-wider rounded border transition-colors ${ann.outlineColor === null ? 'border-[var(--ink)] bg-[var(--ink)] text-[var(--bg)]' : 'border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--ink)]'}`}
-                title="Reset to auto-darkened fill color"
-              >
-                Auto
-              </button>
-              {[ '#1F1B16', '#FFFFFF', '#000000' ].map(c => (
-                <button
-                  key={c}
-                  onClick={() => onUpdate({ outlineColor: c })}
-                  className={`w-5 h-5 rounded-sm border hover:scale-110 transition-transform ${ann.outlineColor && ann.outlineColor.toLowerCase() === c.toLowerCase() ? 'border-[var(--ink)] ring-1 ring-[var(--ink)]' : 'border-[var(--border-strong)]'}`}
-                  style={{ background: c }}
-                  title={c}
+          {ann.shape !== 'line' && (
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Outline</div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="color"
+                  value={ann.outlineColor || darken(ann.color, 0.5)}
+                  onChange={e => onUpdate({ outlineColor: e.target.value })}
+                  className="w-8 h-8 rounded border border-[var(--border)] cursor-pointer bg-[var(--bg)]"
+                  title={ann.outlineColor ? 'Custom outline color' : 'Auto (darkened fill)'}
                 />
-              ))}
+                <button
+                  onClick={() => onUpdate({ outlineColor: null })}
+                  className={`px-2 py-1 text-[10px] uppercase tracking-wider rounded border transition-colors ${ann.outlineColor === null ? 'border-[var(--ink)] bg-[var(--ink)] text-[var(--bg)]' : 'border-[var(--border-strong)] text-[var(--muted)] hover:text-[var(--ink)]'}`}
+                  title="Reset to auto-darkened fill color"
+                >
+                  Auto
+                </button>
+                {[ '#1F1B16', '#FFFFFF', '#000000' ].map(c => (
+                  <button
+                    key={c}
+                    onClick={() => onUpdate({ outlineColor: c })}
+                    className={`w-5 h-5 rounded-sm border hover:scale-110 transition-transform ${ann.outlineColor && ann.outlineColor.toLowerCase() === c.toLowerCase() ? 'border-[var(--ink)] ring-1 ring-[var(--ink)]' : 'border-[var(--border-strong)]'}`}
+                    style={{ background: c }}
+                    title={c}
+                  />
+                ))}
+              </div>
             </div>
-            {ann.shape === 'line' && (
-              <div className="text-[9.5px] text-[var(--muted)] mt-1 italic">lines have no outline — fill color is used</div>
-            )}
-          </div>
+          )}
+
+          {ann.shape !== 'line' && (
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium flex items-center justify-between">
+                <span>Outline thickness</span>
+                <span className="font-mono text-[var(--ink)] normal-case tracking-normal text-[11px]">
+                  {(ann.outlineWidth ?? DEFAULT_ANNOTATION_OUTLINE_WIDTH).toFixed(1)}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min="0"
+                  max="6"
+                  step="0.1"
+                  value={ann.outlineWidth ?? DEFAULT_ANNOTATION_OUTLINE_WIDTH}
+                  onChange={e => onUpdate({ outlineWidth: parseFloat(e.target.value) })}
+                  className="thickness-slider flex-1"
+                />
+                <button
+                  onClick={() => onUpdate({ outlineWidth: DEFAULT_ANNOTATION_OUTLINE_WIDTH })}
+                  className="text-[10px] uppercase tracking-wider text-[var(--muted)] hover:text-[var(--ink)] px-1.5 py-0.5 transition-colors"
+                  title="Reset to default outline thickness"
+                >
+                  reset
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Label distance */}
           <div>
@@ -1657,16 +2440,17 @@ function AnnotationCard({ ann, total, onUpdate, onRemove, onHover, isHovered }) 
 }
 
 /* ---------- highlight card in the panel ---------- */
-function HighlightCard({ hl, total, onUpdate, onRemove }) {
+function HighlightCard({ hl, total, viewMode, onUpdate, onRemove }) {
   const collapsed = hl.collapsed;
   const valid = !hl.error;
+  const isLinear = viewMode === 'linear';
   return (
     <div className="bg-[var(--bg-tint)] border border-[var(--border)] rounded-lg overflow-hidden">
       <div className="flex items-center px-3 py-2 gap-2 cursor-pointer" onClick={() => onUpdate({ collapsed: !collapsed })}>
         <div className="w-3 h-3 rounded-sm flex-shrink-0" style={{ background: hl.color, opacity: 0.5 }} />
         <div className="flex-1 text-[13px] font-medium truncate">{hl.name || <span className="italic text-[var(--muted)]">unnamed</span>}</div>
         <div className="text-[9px] uppercase tracking-wider text-[var(--muted)] font-mono">
-          R{hl.ring ?? 1}
+          {isLinear ? 'T' : 'R'}{hl.ring ?? 1}
         </div>
         {!valid && <AlertCircle size={12} className="text-[var(--accent)]" />}
         <button
@@ -1688,7 +2472,7 @@ function HighlightCard({ hl, total, onUpdate, onRemove }) {
           <div>
             <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Locate by</div>
             <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
-              <SegBtn active={hl.mode === 'sequence'} onClick={() => onUpdate({ mode: 'sequence' })} title="Search subsequence in plasmid">
+              <SegBtn active={hl.mode === 'sequence'} onClick={() => onUpdate({ mode: 'sequence' })} title="Search subsequence">
                 <Search size={11} /> Sequence
               </SegBtn>
               <SegBtn active={(hl.mode ?? 'position') === 'position'} onClick={() => onUpdate({ mode: 'position' })} title="Specify start and end positions">
@@ -1739,7 +2523,7 @@ function HighlightCard({ hl, total, onUpdate, onRemove }) {
                 </Field>
               </div>
               {!valid && (
-                <div className="text-[10px] text-[var(--accent)] italic">Position out of range</div>
+                <div className="text-[10px] text-[var(--accent)] italic">{hl.error}</div>
               )}
             </>
           )}
@@ -1754,13 +2538,22 @@ function HighlightCard({ hl, total, onUpdate, onRemove }) {
           </div>
 
           <div>
-            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Ring</div>
+            <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">
+              {isLinear ? 'Track' : 'Ring'}
+            </div>
             <div className="flex items-center border border-[var(--border)] rounded-md overflow-hidden bg-[var(--bg)] max-w-[140px]">
-              <button onClick={() => onUpdate({ ring: Math.max(0, (hl.ring ?? 1) - 1) })}
+              <button onClick={() => onUpdate({ ring: Math.max(trackMin(isLinear), (hl.ring ?? 1) - 1) })}
                 className="px-2 py-1.5 text-[var(--muted)] hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors">−</button>
               <div className="flex-1 text-center font-mono text-[12px]">{hl.ring ?? 1}</div>
-              <button onClick={() => onUpdate({ ring: Math.min(8, (hl.ring ?? 1) + 1) })}
+              <button onClick={() => onUpdate({ ring: Math.min(trackMax(isLinear), (hl.ring ?? 1) + 1) })}
                 className="px-2 py-1.5 text-[var(--muted)] hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors">+</button>
+            </div>
+            <div className="text-[9.5px] text-[var(--muted)] mt-1 italic">
+              {(hl.ring ?? 1) === 0
+                ? 'on backbone'
+                : isLinear
+                  ? `track ${hl.ring ?? 1} ${(hl.ring ?? 1) > 0 ? 'above' : 'below'}`
+                  : `ring ${hl.ring ?? 1} ${(hl.ring ?? 1) > 0 ? 'outward' : 'inward'}`}
             </div>
           </div>
 
@@ -1895,7 +2688,7 @@ function HighlightCard({ hl, total, onUpdate, onRemove }) {
               className="flex items-center gap-2 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
             >
               {hl.showLabel !== false ? <Eye size={12} /> : <EyeOff size={12} />}
-              Curved label {hl.showLabel !== false ? 'visible' : 'hidden'}
+              {isLinear ? 'Label' : 'Curved label'} {hl.showLabel !== false ? 'visible' : 'hidden'}
             </button>
             <button
               onClick={() => onUpdate({ showBoundaries: !hl.showBoundaries })}

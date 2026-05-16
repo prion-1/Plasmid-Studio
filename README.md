@@ -1,23 +1,26 @@
 # Plasmid Studio
 
-Plasmid Studio is a browser-based circular plasmid map editor for making clean,
-exportable plasmid diagrams.
+Plasmid Studio is a browser-based sequence map editor for making clean,
+exportable plasmid and linear sequence diagrams.
 
-The app lets you paste or edit a plasmid sequence, add annotated features by
-base-pair position or sequence search, style the map, and export the result as
-an SVG.
+The app lets you paste or edit a DNA sequence, add annotated features by
+base-pair position or sequence search, switch between circular and linear
+representations, style the map, and export the active view as an SVG.
 
 ## Features
 
-- Circular plasmid map rendering with configurable backbone radius, thickness,
-  rotation, background, and typography.
+- Two rendering modes: a **circular plasmid map** tab and a **linear sequence tab** with rich formatting options, including DNA strand thickness and colors.
+- Linear sequence rendering with selectable termini, including open ITR-style terminal loops, or broken-sequence
+  `...//` markers.
+
 - Feature annotations with arrows, blocks, or line segments.
 - Annotation lookup by explicit start/end position or by sequence match,
-  including reverse-complement matching.
-- Multi-ring layouts with per-feature color, outline, thickness, label
-  position, and label visibility controls.
-- Translucent highlight regions with curved labels and optional boundary
+  including reverse-complement matching. Circular mode supports wraparound
+  matches; linear mode validates features as non-wrapping ranges.
+- Multi-ring layouts with per-feature formatting controls.
+- Translucent labeled highlight regions with optional boundary
   markers.
+- Toggleable tick marks and tick labels.
 - SVG export for publication figures, slides, and design notes.
 
 > [!tip]
@@ -27,9 +30,13 @@ Launch plasmid.studio:
 </a>
 
 ## Examples
+
 <p align="center">
   <img src="./demo/scAAV.svg" width="45%" />
   <img src="./demo/pExample.svg" width="45%" />
+</p>
+<p align="center">
+  <img src="./demo/Cargo.svg" width="91%" />
 </p>
 
 ## Development
