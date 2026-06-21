@@ -21,6 +21,8 @@ representations, style the map, and export the active view as an SVG.
 - Translucent labeled highlight regions with optional boundary
   markers.
 - Toggleable tick marks and tick labels.
+- FASTA and raw DNA file upload, with FASTA headers used as map names.
+- Versioned JSON project save/load plus automatic local browser autosave.
 - SVG export for publication figures, slides, and design notes.
 
 > [!tip]

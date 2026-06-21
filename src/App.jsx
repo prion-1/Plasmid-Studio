@@ -1,7 +1,7 @@
-import { useState, useMemo, useRef, useCallback } from 'react';
+import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import {
   Plus, Trash2, ChevronDown, ChevronUp, ArrowRight, ArrowLeft,
-  Search, Hash, Download, AlertCircle, Eye, EyeOff
+  Search, Hash, Download, AlertCircle, Eye, EyeOff, Upload, FolderOpen, Save
 } from 'lucide-react';
 
 /* ---------- constants ---------- */
@@ -17,6 +17,9 @@ const LINEAR_SEQ_LEFT = -315;
 const LINEAR_SEQ_RIGHT = 315;
 const LINEAR_SEQ_Y = 55;
 const LINEAR_TERMINUS_EXT = 46;
+const PROJECT_FORMAT = 'plasmid-studio-project';
+const PROJECT_VERSION = 1;
+const AUTOSAVE_KEY = `plasmid-studio:autosave:v${PROJECT_VERSION}`;
 
 // matplotlib plasma colormap, sampled at 10 evenly-spaced points
 const PALETTE_PLASMA = [
@@ -458,6 +461,182 @@ const createDefaultTerminiLabels = () => ({
   color: null,
 });
 
+const createDefaultProjectState = () => ({
+  activeView: 'plasmid',
+  plasmidName: 'pExample',
+  plasmidSeqRaw: generateDummySeq(3000),
+  annotations: initialAnnotations.map(annotation => ({ ...annotation })),
+  bgColor: '#F5F1EA',
+  showName: true,
+  showSize: true,
+  showTicks: true,
+  backboneThickness: 1.2,
+  backboneColor: null,
+  rotation: 0,
+  radiusOffset: 0,
+  linearTermini: 'none',
+  terminiLabels: createDefaultTerminiLabels(),
+  fontFamily: "'Instrument Serif', Georgia, serif",
+  labelFontSize: 11.5,
+  tickFontSize: 8.5,
+  nameFontSize: 32,
+  linearTitleDistance: 229,
+  textColor: null,
+  highlights: [],
+});
+
+const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const finiteOr = (value, fallback) => Number.isFinite(value) ? value : fallback;
+const stringOr = (value, fallback) => typeof value === 'string' ? value : fallback;
+const booleanOr = (value, fallback) => typeof value === 'boolean' ? value : fallback;
+const nullableStringOr = (value, fallback) => value === null || typeof value === 'string' ? value : fallback;
+
+const normalizeProjectState = (state) => {
+  if (!isRecord(state)) throw new Error('Project state is missing or invalid.');
+  if (typeof state.plasmidSeqRaw !== 'string') throw new Error('Project sequence is missing or invalid.');
+  if (!Array.isArray(state.annotations) || !Array.isArray(state.highlights)) {
+    throw new Error('Project annotations or highlights are invalid.');
+  }
+
+  const defaults = createDefaultProjectState();
+  const normalizeItem = (item, index, type) => {
+    if (!isRecord(item)) throw new Error(`Project ${type} ${index + 1} is invalid.`);
+    return {
+      ...item,
+      id: Number.isFinite(item.id) ? item.id : index + 1,
+      name: stringOr(item.name, `${type === 'annotation' ? 'Feature' : 'Region'} ${index + 1}`),
+      mode: item.mode === 'sequence' ? 'sequence' : 'position',
+      querySeq: stringOr(item.querySeq, ''),
+      start: finiteOr(item.start, 1),
+      end: finiteOr(item.end, 1),
+      color: stringOr(item.color, type === 'annotation' ? PALETTE[index % PALETTE.length] : HIGHLIGHT_PALETTE[index % HIGHLIGHT_PALETTE.length]),
+    };
+  };
+
+  const termini = isRecord(state.terminiLabels) ? state.terminiLabels : {};
+  const defaultTermini = defaults.terminiLabels;
+
+  return {
+    activeView: state.activeView === 'linear' ? 'linear' : 'plasmid',
+    plasmidName: stringOr(state.plasmidName, defaults.plasmidName),
+    plasmidSeqRaw: state.plasmidSeqRaw,
+    annotations: state.annotations.map((item, index) => normalizeItem(item, index, 'annotation')),
+    bgColor: stringOr(state.bgColor, defaults.bgColor),
+    showName: booleanOr(state.showName, defaults.showName),
+    showSize: booleanOr(state.showSize, defaults.showSize),
+    showTicks: booleanOr(state.showTicks, defaults.showTicks),
+    backboneThickness: finiteOr(state.backboneThickness, defaults.backboneThickness),
+    backboneColor: nullableStringOr(state.backboneColor, defaults.backboneColor),
+    rotation: finiteOr(state.rotation, defaults.rotation),
+    radiusOffset: finiteOr(state.radiusOffset, defaults.radiusOffset),
+    linearTermini: ['none', 'line', 'itr', 'break'].includes(state.linearTermini) ? state.linearTermini : defaults.linearTermini,
+    terminiLabels: {
+      left: {
+        visible: booleanOr(termini.left?.visible, defaultTermini.left.visible),
+        text: stringOr(termini.left?.text, defaultTermini.left.text),
+      },
+      right: {
+        visible: booleanOr(termini.right?.visible, defaultTermini.right.visible),
+        text: stringOr(termini.right?.text, defaultTermini.right.text),
+      },
+      distance: finiteOr(termini.distance, defaultTermini.distance),
+      size: finiteOr(termini.size, defaultTermini.size),
+      color: nullableStringOr(termini.color, defaultTermini.color),
+    },
+    fontFamily: stringOr(state.fontFamily, defaults.fontFamily),
+    labelFontSize: finiteOr(state.labelFontSize, defaults.labelFontSize),
+    tickFontSize: finiteOr(state.tickFontSize, defaults.tickFontSize),
+    nameFontSize: finiteOr(state.nameFontSize, defaults.nameFontSize),
+    linearTitleDistance: finiteOr(state.linearTitleDistance, defaults.linearTitleDistance),
+    textColor: nullableStringOr(state.textColor, defaults.textColor),
+    highlights: state.highlights.map((item, index) => normalizeItem(item, index, 'highlight')),
+  };
+};
+
+const parseProjectDocument = (text) => {
+  let document;
+  try {
+    document = JSON.parse(text);
+  } catch {
+    throw new Error('This file is not valid JSON.');
+  }
+  if (!isRecord(document) || document.format !== PROJECT_FORMAT) {
+    throw new Error('This is not a Plasmid Studio project file.');
+  }
+  if (document.version !== PROJECT_VERSION) {
+    throw new Error(`Unsupported project version: ${document.version ?? 'missing'}.`);
+  }
+  return normalizeProjectState(document.state);
+};
+
+const createProjectDocument = state => ({
+  format: PROJECT_FORMAT,
+  version: PROJECT_VERSION,
+  savedAt: new Date().toISOString(),
+  state,
+});
+
+const loadInitialProject = () => {
+  const fallback = { state: createDefaultProjectState(), notice: null };
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const saved = window.localStorage.getItem(AUTOSAVE_KEY);
+    if (!saved) return fallback;
+    return {
+      state: parseProjectDocument(saved),
+      notice: { type: 'success', text: 'Restored your locally autosaved project.' },
+    };
+  } catch {
+    return {
+      ...fallback,
+      notice: { type: 'error', text: 'The local autosave could not be restored; the example project was loaded.' },
+    };
+  }
+};
+
+const parseSequenceFile = (text, fileName) => {
+  const normalized = text.replace(/^\uFEFF/, '').trim();
+  if (!normalized) throw new Error('The selected sequence file is empty.');
+
+  let name = fileName.replace(/\.(fa|fasta|fna|ffn|txt|dna)$/i, '');
+  let sequenceText = normalized;
+
+  if (normalized.startsWith('>')) {
+    const lines = normalized.split(/\r?\n/);
+    const header = lines.shift().slice(1).trim();
+    if (lines.some(line => line.trim().startsWith('>'))) {
+      throw new Error('Please upload a FASTA file containing exactly one sequence.');
+    }
+    if (header) name = header;
+    sequenceText = lines.join('');
+  }
+
+  const compactSequence = sequenceText.replace(/\s/g, '').toUpperCase();
+  if (!compactSequence) throw new Error('No DNA sequence was found in the selected file.');
+  if (/[^ACGTN]/.test(compactSequence)) {
+    throw new Error('Sequence files may contain only A, C, G, T, N, and whitespace.');
+  }
+
+  return { name, sequence: compactSequence };
+};
+
+const safeFileName = (name, fallback) => {
+  const cleaned = (name || fallback).trim().replace(/[\\/:*?"<>|]+/g, '-');
+  return cleaned || fallback;
+};
+
+const downloadFile = (contents, type, fileName) => {
+  const blob = new Blob([contents], { type });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
+};
+
 /* ---------- small UI primitives ---------- */
 const Field = ({ label, children, hint }) => (
   <label className="block">
@@ -493,36 +672,87 @@ const SegBtn = ({ active, onClick, children, title }) => (
 
 /* ---------- main component ---------- */
 export default function PlasmidMapEditor() {
-  const [activeView, setActiveView] = useState('plasmid');
-  const [plasmidName, setPlasmidName] = useState('pExample');
-  const [plasmidSeqRaw, setPlasmidSeqRaw] = useState(generateDummySeq(3000));
-  const [annotations, setAnnotations] = useState(initialAnnotations);
+  const [initialLoad] = useState(loadInitialProject);
+  const initialProject = initialLoad.state;
+
+  const [activeView, setActiveView] = useState(initialProject.activeView);
+  const [plasmidName, setPlasmidName] = useState(initialProject.plasmidName);
+  const [plasmidSeqRaw, setPlasmidSeqRaw] = useState(initialProject.plasmidSeqRaw);
+  const [annotations, setAnnotations] = useState(initialProject.annotations);
   const [hoveredId, setHoveredId] = useState(null);
   const [showSeqInput, setShowSeqInput] = useState(false);
   // canvas-level display settings
-  const [bgColor, setBgColor] = useState('#F5F1EA');
-  const [showName, setShowName] = useState(true);
-  const [showSize, setShowSize] = useState(true);
-  const [showTicks, setShowTicks] = useState(true);
-  const [backboneThickness, setBackboneThickness] = useState(1.2);
-  const [backboneColor, setBackboneColor] = useState(null); // null = use theme
-  const [rotation, setRotation] = useState(0); // degrees, applies to ring content
-  const [radiusOffset, setRadiusOffset] = useState(0); // -100 to +150, modifies plasmid radius
-  const [linearTermini, setLinearTermini] = useState('none');
-  const [terminiLabels, setTerminiLabels] = useState(createDefaultTerminiLabels);
+  const [bgColor, setBgColor] = useState(initialProject.bgColor);
+  const [showName, setShowName] = useState(initialProject.showName);
+  const [showSize, setShowSize] = useState(initialProject.showSize);
+  const [showTicks, setShowTicks] = useState(initialProject.showTicks);
+  const [backboneThickness, setBackboneThickness] = useState(initialProject.backboneThickness);
+  const [backboneColor, setBackboneColor] = useState(initialProject.backboneColor); // null = use theme
+  const [rotation, setRotation] = useState(initialProject.rotation); // degrees, applies to ring content
+  const [radiusOffset, setRadiusOffset] = useState(initialProject.radiusOffset); // -100 to +150, modifies plasmid radius
+  const [linearTermini, setLinearTermini] = useState(initialProject.linearTermini);
+  const [terminiLabels, setTerminiLabels] = useState(initialProject.terminiLabels);
   // typography
-  const [fontFamily, setFontFamily] = useState("'Instrument Serif', Georgia, serif");
-  const [labelFontSize, setLabelFontSize] = useState(11.5);
-  const [tickFontSize, setTickFontSize] = useState(8.5);
-  const [nameFontSize, setNameFontSize] = useState(32);
-  const [linearTitleDistance, setLinearTitleDistance] = useState(229);
-  const [textColor, setTextColor] = useState(null); // null = theme.ink
+  const [fontFamily, setFontFamily] = useState(initialProject.fontFamily);
+  const [labelFontSize, setLabelFontSize] = useState(initialProject.labelFontSize);
+  const [tickFontSize, setTickFontSize] = useState(initialProject.tickFontSize);
+  const [nameFontSize, setNameFontSize] = useState(initialProject.nameFontSize);
+  const [linearTitleDistance, setLinearTitleDistance] = useState(initialProject.linearTitleDistance);
+  const [textColor, setTextColor] = useState(initialProject.textColor); // null = theme.ink
   // highlights — translucent bands with curved labels
-  const [highlights, setHighlights] = useState([]);
+  const [highlights, setHighlights] = useState(initialProject.highlights);
+  const [notice, setNotice] = useState(initialLoad.notice);
+  const [confirmingBlank, setConfirmingBlank] = useState(false);
   const svgRef = useRef(null);
   const listEndRef = useRef(null);
-  const idCounter = useRef(100);
+  const projectFileRef = useRef(null);
+  const sequenceFileRef = useRef(null);
+  const highestInitialId = Math.max(0, ...initialProject.annotations.map(item => item.id), ...initialProject.highlights.map(item => item.id));
+  const idCounter = useRef(Math.max(100, highestInitialId + 1));
   const isPlasmidView = activeView === 'plasmid';
+
+  const projectState = useMemo(() => ({
+    activeView,
+    plasmidName,
+    plasmidSeqRaw,
+    annotations,
+    bgColor,
+    showName,
+    showSize,
+    showTicks,
+    backboneThickness,
+    backboneColor,
+    rotation,
+    radiusOffset,
+    linearTermini,
+    terminiLabels,
+    fontFamily,
+    labelFontSize,
+    tickFontSize,
+    nameFontSize,
+    linearTitleDistance,
+    textColor,
+    highlights,
+  }), [
+    activeView, plasmidName, plasmidSeqRaw, annotations, bgColor, showName,
+    showSize, showTicks, backboneThickness, backboneColor, rotation, radiusOffset,
+    linearTermini, terminiLabels, fontFamily, labelFontSize, tickFontSize,
+    nameFontSize, linearTitleDistance, textColor, highlights,
+  ]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(
+          AUTOSAVE_KEY,
+          JSON.stringify(createProjectDocument(projectState)),
+        );
+      } catch (error) {
+        console.warn('Could not autosave Plasmid Studio project.', error);
+      }
+    }, 400);
+    return () => window.clearTimeout(timeout);
+  }, [projectState]);
 
   // SVG theme — derived from bg luminance so labels stay readable on any bg
   const theme = useMemo(() => {
@@ -690,20 +920,83 @@ export default function PlasmidMapEditor() {
     }));
   }, []);
 
+  const applyProjectState = (project) => {
+    setActiveView(project.activeView);
+    setPlasmidName(project.plasmidName);
+    setPlasmidSeqRaw(project.plasmidSeqRaw);
+    setAnnotations(project.annotations);
+    setBgColor(project.bgColor);
+    setShowName(project.showName);
+    setShowSize(project.showSize);
+    setShowTicks(project.showTicks);
+    setBackboneThickness(project.backboneThickness);
+    setBackboneColor(project.backboneColor);
+    setRotation(project.rotation);
+    setRadiusOffset(project.radiusOffset);
+    setLinearTermini(project.linearTermini);
+    setTerminiLabels(project.terminiLabels);
+    setFontFamily(project.fontFamily);
+    setLabelFontSize(project.labelFontSize);
+    setTickFontSize(project.tickFontSize);
+    setNameFontSize(project.nameFontSize);
+    setLinearTitleDistance(project.linearTitleDistance);
+    setTextColor(project.textColor);
+    setHighlights(project.highlights);
+    setHoveredId(null);
+    setConfirmingBlank(false);
+    const highestId = Math.max(0, ...project.annotations.map(item => item.id), ...project.highlights.map(item => item.id));
+    idCounter.current = Math.max(100, highestId + 1);
+  };
+
+  const handleProjectUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const project = parseProjectDocument(await file.text());
+      applyProjectState(project);
+      setNotice({ type: 'success', text: `Opened project “${file.name}”.` });
+    } catch (error) {
+      setNotice({ type: 'error', text: error instanceof Error ? error.message : 'Could not open this project.' });
+    }
+  };
+
+  const handleSequenceUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const imported = parseSequenceFile(await file.text(), file.name);
+      setPlasmidName(imported.name);
+      setPlasmidSeqRaw(imported.sequence);
+      setShowSeqInput(false);
+      setNotice({
+        type: 'success',
+        text: `Loaded ${imported.sequence.length.toLocaleString()} bp from “${file.name}”. Existing annotations were retained.`,
+      });
+    } catch (error) {
+      setNotice({ type: 'error', text: error instanceof Error ? error.message : 'Could not open this sequence file.' });
+    }
+  };
+
+  const downloadProjectJSON = () => {
+    const fileName = `${safeFileName(plasmidName, 'plasmid')}.plasmid.json`;
+    const json = JSON.stringify(createProjectDocument(projectState), null, 2);
+    downloadFile(json, 'application/json', fileName);
+    setNotice({ type: 'success', text: `Saved editable project as “${fileName}”.` });
+  };
+
   const downloadSVG = () => {
     if (!svgRef.current) return;
     const clone = svgRef.current.cloneNode(true);
     clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
     const xml = new XMLSerializer().serializeToString(clone);
-    const blob = new Blob([`<?xml version="1.0" encoding="UTF-8"?>\n${xml}`], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `${plasmidName || 'plasmid'}.svg`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    downloadFile(
+      `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`,
+      'image/svg+xml',
+      `${safeFileName(plasmidName, 'plasmid')}.svg`,
+    );
   };
-
-  const [confirmingBlank, setConfirmingBlank] = useState(false);
 
   const blankAll = () => {
     // Two-click confirm: first click arms the button, second click commits.
@@ -822,6 +1115,27 @@ export default function PlasmidMapEditor() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <input
+            ref={projectFileRef}
+            type="file"
+            accept=".json,.plasmid.json,application/json"
+            onChange={handleProjectUpload}
+            className="hidden"
+          />
+          <button
+            onClick={() => projectFileRef.current?.click()}
+            className="flex items-center gap-1.5 text-[12px] px-3 py-1.5 border border-[var(--border-strong)] rounded-md text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-tint)] transition-colors"
+            title="Open an editable Plasmid Studio JSON project"
+          >
+            <FolderOpen size={13} /> Open
+          </button>
+          <button
+            onClick={downloadProjectJSON}
+            className="flex items-center gap-1.5 text-[12px] px-3 py-1.5 border border-[var(--border-strong)] rounded-md text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-tint)] transition-colors"
+            title="Save an editable Plasmid Studio JSON project"
+          >
+            <Save size={13} /> Save project
+          </button>
           <button
             onClick={blankAll}
             className={`flex items-center gap-1.5 text-[12px] px-3 py-1.5 border rounded-md transition-colors ${confirmingBlank ? 'bg-[var(--accent)] text-white border-[var(--accent)]' : 'border-[var(--border-strong)] text-[var(--muted)] hover:bg-[var(--accent)] hover:text-white hover:border-[var(--accent)]'}`}
@@ -850,6 +1164,20 @@ export default function PlasmidMapEditor() {
                 Linear sequence
               </SegBtn>
             </div>
+            <div className="mt-2 flex items-start justify-between gap-2 px-1" aria-live="polite">
+              <div className="text-[9.5px] uppercase tracking-[0.12em] text-[var(--muted)]">
+                Autosave on · this browser
+              </div>
+              {notice && (
+                <button
+                  onClick={() => setNotice(null)}
+                  className={`flex-1 text-right text-[10px] leading-snug ${notice.type === 'error' ? 'text-[var(--accent)]' : 'text-[var(--muted)]'}`}
+                  title="Dismiss message"
+                >
+                  {notice.text} ×
+                </button>
+              )}
+            </div>
           </div>
           <div className="overflow-y-auto scroll-fade flex-1 p-5 space-y-4">
             {/* Plasmid info card */}
@@ -864,13 +1192,29 @@ export default function PlasmidMapEditor() {
                 <Input value={plasmidName} onChange={e => setPlasmidName(e.target.value)} placeholder={isPlasmidView ? 'pUC19' : 'linear construct'} />
               </Field>
               <div>
-                <button
-                  onClick={() => setShowSeqInput(v => !v)}
-                  className="text-[11px] text-[var(--muted)] hover:text-[var(--ink)] flex items-center gap-1 transition-colors"
-                >
-                  {showSeqInput ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-                  {showSeqInput ? 'Hide' : 'Edit'} sequence
-                </button>
+                <input
+                  ref={sequenceFileRef}
+                  type="file"
+                  accept=".fa,.fasta,.fna,.ffn,.txt,.dna,text/plain"
+                  onChange={handleSequenceUpload}
+                  className="hidden"
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    onClick={() => setShowSeqInput(v => !v)}
+                    className="text-[11px] text-[var(--muted)] hover:text-[var(--ink)] flex items-center gap-1 transition-colors"
+                  >
+                    {showSeqInput ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                    {showSeqInput ? 'Hide' : 'Edit'} sequence
+                  </button>
+                  <button
+                    onClick={() => sequenceFileRef.current?.click()}
+                    className="text-[11px] text-[var(--muted)] hover:text-[var(--ink)] flex items-center gap-1 transition-colors"
+                    title="Upload one FASTA or raw DNA sequence"
+                  >
+                    <Upload size={12} /> Upload FASTA / DNA
+                  </button>
+                </div>
                 {showSeqInput && (
                   <div className="mt-2">
                     <TextArea
