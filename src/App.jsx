@@ -1,7 +1,8 @@
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import {
   Plus, Trash2, ChevronDown, ChevronUp, ArrowRight, ArrowLeft,
-  Search, Hash, Download, AlertCircle, Eye, EyeOff, Upload, FolderOpen, Save
+  Search, Hash, Download, AlertCircle, Eye, EyeOff, Upload, FolderOpen, Save,
+  ImageDown, ZoomIn, ZoomOut, Maximize2
 } from 'lucide-react';
 
 /* ---------- constants ---------- */
@@ -92,10 +93,35 @@ const HIGHLIGHT_PALETTE_CIVIDIS = [
   '#8a8678', '#a59c74', '#c3b369', '#e1cc55', '#fee838',
 ];
 
+const COMMON_RESTRICTION_SITES = [
+  { id: 'EcoRI', name: 'EcoRI', sequence: 'GAATTC' },
+  { id: 'BamHI', name: 'BamHI', sequence: 'GGATCC' },
+  { id: 'HindIII', name: 'HindIII', sequence: 'AAGCTT' },
+  { id: 'NotI', name: 'NotI', sequence: 'GCGGCCGC' },
+  { id: 'XhoI', name: 'XhoI', sequence: 'CTCGAG' },
+  { id: 'XbaI', name: 'XbaI', sequence: 'TCTAGA' },
+  { id: 'SpeI', name: 'SpeI', sequence: 'ACTAGT' },
+  { id: 'NheI', name: 'NheI', sequence: 'GCTAGC' },
+  { id: 'PstI', name: 'PstI', sequence: 'CTGCAG' },
+  { id: 'KpnI', name: 'KpnI', sequence: 'GGTACC' },
+  { id: 'SacI', name: 'SacI', sequence: 'GAGCTC' },
+  { id: 'SalI', name: 'SalI', sequence: 'GTCGAC' },
+  { id: 'BglII', name: 'BglII', sequence: 'AGATCT' },
+  { id: 'NcoI', name: 'NcoI', sequence: 'CCATGG' },
+  { id: 'SmaI', name: 'SmaI', sequence: 'CCCGGG' },
+  { id: 'AgeI', name: 'AgeI', sequence: 'ACCGGT' },
+  { id: 'ApaI', name: 'ApaI', sequence: 'GGGCCC' },
+  { id: 'AvrII', name: 'AvrII', sequence: 'CCTAGG' },
+  { id: 'BsaI', name: 'BsaI', sequence: 'GGTCTC' },
+  { id: 'BsmBI', name: 'BsmBI', sequence: 'CGTCTC' },
+];
+
 /* ---------- sequence helpers ---------- */
 const cleanSeq = (s) => (s || '').toUpperCase().replace(/[^ACGTN]/g, '');
 const COMPLEMENT = { A: 'T', T: 'A', C: 'G', G: 'C', N: 'N' };
 const revComp = (s) => s.split('').reverse().map(c => COMPLEMENT[c] || 'N').join('');
+
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
 const findSubseq = (plasmid, query, { circular = true } = {}) => {
   if (!query || !plasmid) return null;
@@ -116,6 +142,37 @@ const findSubseq = (plasmid, query, { circular = true } = {}) => {
     return { start, end, direction: 'reverse', length: q.length };
   }
   return null;
+};
+
+const sequenceMatchesAt = (sequence, pattern, start, circular) => {
+  for (let i = 0; i < pattern.length; i++) {
+    const base = circular ? sequence[(start + i) % sequence.length] : sequence[start + i];
+    const expected = pattern[i];
+    if (!base || (expected !== 'N' && base !== expected)) return false;
+  }
+  return true;
+};
+
+const findAllSubseqMatches = (sequence, query, { circular = true } = {}) => {
+  const q = cleanSeq(query);
+  if (!sequence || !q || q.length > sequence.length) return [];
+  const patterns = [{ sequence: q, direction: 'forward' }];
+  const rc = revComp(q);
+  if (rc !== q) patterns.push({ sequence: rc, direction: 'reverse' });
+
+  const matches = [];
+  const seen = new Set();
+  for (const pattern of patterns) {
+    const limit = circular ? sequence.length : sequence.length - pattern.sequence.length + 1;
+    for (let i = 0; i < limit; i++) {
+      if (!sequenceMatchesAt(sequence, pattern.sequence, i, circular)) continue;
+      const key = `${i + 1}:${pattern.direction}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      matches.push({ start: i + 1, end: ((i + q.length - 1) % sequence.length) + 1, direction: pattern.direction });
+    }
+  }
+  return matches.sort((a, b) => a.start - b.start || a.direction.localeCompare(b.direction));
 };
 
 const resolveLocatedItems = (items, sequence, total, circular) => {
@@ -434,6 +491,39 @@ const tickInterval = (total) => {
   return 100000;
 };
 
+const createDefaultRestrictionSettings = () => ({
+  enabled: false,
+  showLabels: true,
+  selectedIds: [],
+  customSites: [],
+});
+
+const buildRestrictionSiteResults = (sequence, settings, circular) => {
+  const selectedIds = new Set(settings.selectedIds || []);
+  const commonSites = COMMON_RESTRICTION_SITES
+    .map(site => ({ ...site, source: 'common', enabled: selectedIds.has(site.id) }));
+  const customSites = (settings.customSites || [])
+    .map(site => ({ ...site, source: 'custom', enabled: site.enabled !== false }));
+
+  const all = [...commonSites, ...customSites].map(site => {
+    const matches = findAllSubseqMatches(sequence, site.sequence, { circular });
+    return { ...site, matches, count: matches.length };
+  });
+  const visible = all.filter(site => site.enabled && site.count > 0);
+  const markers = visible.flatMap(site => (
+    site.matches.map((match, index) => ({
+      ...match,
+      id: `${site.id}-${index}-${match.start}-${match.direction}`,
+      siteId: site.id,
+      name: site.name,
+      sequence: site.sequence,
+      source: site.source,
+    }))
+  ));
+
+  return { all, visible, markers };
+};
+
 /* ---------- demo data ---------- */
 const generateDummySeq = (length, seed = 42) => {
   const bases = 'ACGT';
@@ -482,6 +572,7 @@ const createDefaultProjectState = () => ({
   nameFontSize: 32,
   linearTitleDistance: 229,
   textColor: null,
+  restrictionSettings: createDefaultRestrictionSettings(),
   highlights: [],
 });
 
@@ -490,6 +581,34 @@ const finiteOr = (value, fallback) => Number.isFinite(value) ? value : fallback;
 const stringOr = (value, fallback) => typeof value === 'string' ? value : fallback;
 const booleanOr = (value, fallback) => typeof value === 'boolean' ? value : fallback;
 const nullableStringOr = (value, fallback) => value === null || typeof value === 'string' ? value : fallback;
+
+const normalizeRestrictionSettings = (settings, defaults) => {
+  if (!isRecord(settings)) return defaults;
+  const selectedIds = Array.isArray(settings.selectedIds)
+    ? settings.selectedIds.filter(id => COMMON_RESTRICTION_SITES.some(site => site.id === id))
+    : defaults.selectedIds;
+  const customSites = Array.isArray(settings.customSites)
+    ? settings.customSites
+      .filter(isRecord)
+      .map((site, index) => {
+        const sequence = cleanSeq(site.sequence);
+        return {
+          id: stringOr(site.id, `custom-${index + 1}`),
+          name: stringOr(site.name, sequence || `Custom ${index + 1}`),
+          sequence,
+          enabled: booleanOr(site.enabled, true),
+        };
+      })
+      .filter(site => site.sequence.length > 0)
+    : [];
+
+  return {
+    enabled: booleanOr(settings.enabled, defaults.enabled),
+    showLabels: booleanOr(settings.showLabels, defaults.showLabels),
+    selectedIds,
+    customSites,
+  };
+};
 
 const normalizeProjectState = (state) => {
   if (!isRecord(state)) throw new Error('Project state is missing or invalid.');
@@ -549,6 +668,7 @@ const normalizeProjectState = (state) => {
     nameFontSize: finiteOr(state.nameFontSize, defaults.nameFontSize),
     linearTitleDistance: finiteOr(state.linearTitleDistance, defaults.linearTitleDistance),
     textColor: nullableStringOr(state.textColor, defaults.textColor),
+    restrictionSettings: normalizeRestrictionSettings(state.restrictionSettings, defaults.restrictionSettings),
     highlights: state.highlights.map((item, index) => normalizeItem(item, index, 'highlight')),
   };
 };
@@ -625,8 +745,7 @@ const safeFileName = (name, fallback) => {
   return cleaned || fallback;
 };
 
-const downloadFile = (contents, type, fileName) => {
-  const blob = new Blob([contents], { type });
+const downloadBlob = (blob, fileName) => {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
@@ -635,6 +754,10 @@ const downloadFile = (contents, type, fileName) => {
   anchor.click();
   document.body.removeChild(anchor);
   URL.revokeObjectURL(url);
+};
+
+const downloadFile = (contents, type, fileName) => {
+  downloadBlob(new Blob([contents], { type }), fileName);
 };
 
 /* ---------- small UI primitives ---------- */
@@ -699,6 +822,11 @@ export default function PlasmidMapEditor() {
   const [nameFontSize, setNameFontSize] = useState(initialProject.nameFontSize);
   const [linearTitleDistance, setLinearTitleDistance] = useState(initialProject.linearTitleDistance);
   const [textColor, setTextColor] = useState(initialProject.textColor); // null = theme.ink
+  const [restrictionSettings, setRestrictionSettings] = useState(initialProject.restrictionSettings);
+  const [restrictionTab, setRestrictionTab] = useState('active');
+  const [customRestrictionName, setCustomRestrictionName] = useState('');
+  const [customRestrictionSeq, setCustomRestrictionSeq] = useState('');
+  const [viewport, setViewport] = useState({ zoom: 1, panX: 0, panY: 0 });
   // highlights — translucent bands with curved labels
   const [highlights, setHighlights] = useState(initialProject.highlights);
   const [notice, setNotice] = useState(initialLoad.notice);
@@ -707,7 +835,15 @@ export default function PlasmidMapEditor() {
   const listEndRef = useRef(null);
   const projectFileRef = useRef(null);
   const sequenceFileRef = useRef(null);
-  const highestInitialId = Math.max(0, ...initialProject.annotations.map(item => item.id), ...initialProject.highlights.map(item => item.id));
+  const viewportDrag = useRef(null);
+  const highestInitialId = Math.max(
+    0,
+    ...initialProject.annotations.map(item => item.id),
+    ...initialProject.highlights.map(item => item.id),
+    ...initialProject.restrictionSettings.customSites
+      .map(site => parseInt(String(site.id).replace(/^custom-/, ''), 10))
+      .filter(Number.isFinite),
+  );
   const idCounter = useRef(Math.max(100, highestInitialId + 1));
   const isPlasmidView = activeView === 'plasmid';
 
@@ -732,12 +868,13 @@ export default function PlasmidMapEditor() {
     nameFontSize,
     linearTitleDistance,
     textColor,
+    restrictionSettings,
     highlights,
   }), [
     activeView, plasmidName, plasmidSeqRaw, annotations, bgColor, showName,
     showSize, showTicks, backboneThickness, backboneColor, rotation, radiusOffset,
     linearTermini, terminiLabels, fontFamily, labelFontSize, tickFontSize,
-    nameFontSize, linearTitleDistance, textColor, highlights,
+    nameFontSize, linearTitleDistance, textColor, restrictionSettings, highlights,
   ]);
 
   useEffect(() => {
@@ -781,6 +918,10 @@ export default function PlasmidMapEditor() {
   const resolvedHighlights = useMemo(() => (
     resolveLocatedItems(highlights, plasmidSeq, total, isPlasmidView)
   ), [highlights, plasmidSeq, total, isPlasmidView]);
+
+  const restrictionResults = useMemo(() => (
+    buildRestrictionSiteResults(plasmidSeq, restrictionSettings, isPlasmidView)
+  ), [plasmidSeq, restrictionSettings, isPlasmidView]);
 
   // Label collision avoidance: annotations on the same ring with very close
   // label angles get progressively pushed outward so labels don't overlap.
@@ -878,6 +1019,14 @@ export default function PlasmidMapEditor() {
     setAnnotations(prev => prev.filter(a => a.id !== id));
   }, []);
 
+  const openAnnotation = useCallback((id) => {
+    setAnnotations(prev => prev.map(a => a.id === id ? { ...a, collapsed: false } : a));
+    setHoveredId(id);
+    window.setTimeout(() => {
+      document.getElementById(`annotation-card-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 40);
+  }, []);
+
   const addHighlight = useCallback(() => {
     const id = idCounter.current++;
     const colorIdx = highlights.length % HIGHLIGHT_PALETTE.length;
@@ -909,8 +1058,104 @@ export default function PlasmidMapEditor() {
     setHighlights(prev => prev.filter(h => h.id !== id));
   }, []);
 
+  const openHighlight = useCallback((id) => {
+    setHighlights(prev => prev.map(h => h.id === id ? { ...h, collapsed: false } : h));
+    window.setTimeout(() => {
+      document.getElementById(`highlight-card-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 40);
+  }, []);
+
+  const updateRestrictionSettings = useCallback((updates) => {
+    setRestrictionSettings(prev => ({ ...prev, ...updates }));
+  }, []);
+
+  const toggleCommonRestrictionSite = useCallback((id) => {
+    setRestrictionSettings(prev => {
+      const selected = new Set(prev.selectedIds || []);
+      if (selected.has(id)) selected.delete(id);
+      else selected.add(id);
+      return { ...prev, selectedIds: [...selected] };
+    });
+  }, []);
+
+  const toggleCustomRestrictionSite = useCallback((id) => {
+    setRestrictionSettings(prev => ({
+      ...prev,
+      customSites: prev.customSites.map(site => site.id === id ? { ...site, enabled: site.enabled === false } : site),
+    }));
+  }, []);
+
+  const removeCustomRestrictionSite = useCallback((id) => {
+    setRestrictionSettings(prev => ({
+      ...prev,
+      customSites: prev.customSites.filter(site => site.id !== id),
+    }));
+  }, []);
+
+  const addCustomRestrictionSite = useCallback(() => {
+    const sequence = cleanSeq(customRestrictionSeq);
+    if (!sequence || sequence.length < 2) {
+      setNotice({ type: 'error', text: 'Enter a custom site sequence with at least 2 DNA bases.' });
+      return;
+    }
+    const id = `custom-${idCounter.current++}`;
+    setRestrictionSettings(prev => ({
+      ...prev,
+      enabled: true,
+      customSites: [
+        ...prev.customSites,
+        {
+          id,
+          name: customRestrictionName.trim() || sequence,
+          sequence,
+          enabled: true,
+        },
+      ],
+    }));
+    setCustomRestrictionName('');
+    setCustomRestrictionSeq('');
+  }, [customRestrictionName, customRestrictionSeq]);
+
   const updateTerminiLabels = useCallback((updates) => {
     setTerminiLabels(prev => ({ ...prev, ...updates }));
+  }, []);
+
+  const zoomViewport = useCallback((factor) => {
+    setViewport(prev => ({ ...prev, zoom: clamp(parseFloat((prev.zoom * factor).toFixed(2)), 0.5, 4) }));
+  }, []);
+
+  const resetViewport = useCallback(() => {
+    setViewport({ zoom: 1, panX: 0, panY: 0 });
+  }, []);
+
+  const handleViewportPointerDown = useCallback((event) => {
+    if (event.button !== 0) return;
+    if (event.target.closest?.('button,input,select,textarea,a')) return;
+    if (event.target.closest?.('[data-map-interactive="true"]')) return;
+    viewportDrag.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      panX: viewport.panX,
+      panY: viewport.panY,
+    };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }, [viewport.panX, viewport.panY]);
+
+  const handleViewportPointerMove = useCallback((event) => {
+    const drag = viewportDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    setViewport(prev => ({
+      ...prev,
+      panX: drag.panX + event.clientX - drag.startX,
+      panY: drag.panY + event.clientY - drag.startY,
+    }));
+  }, []);
+
+  const handleViewportPointerUp = useCallback((event) => {
+    if (viewportDrag.current?.pointerId === event.pointerId) {
+      viewportDrag.current = null;
+    }
   }, []);
 
   const updateTerminiLabel = useCallback((side, updates) => {
@@ -941,10 +1186,19 @@ export default function PlasmidMapEditor() {
     setNameFontSize(project.nameFontSize);
     setLinearTitleDistance(project.linearTitleDistance);
     setTextColor(project.textColor);
+    setRestrictionSettings(project.restrictionSettings);
     setHighlights(project.highlights);
     setHoveredId(null);
+    setViewport({ zoom: 1, panX: 0, panY: 0 });
     setConfirmingBlank(false);
-    const highestId = Math.max(0, ...project.annotations.map(item => item.id), ...project.highlights.map(item => item.id));
+    const highestId = Math.max(
+      0,
+      ...project.annotations.map(item => item.id),
+      ...project.highlights.map(item => item.id),
+      ...project.restrictionSettings.customSites
+        .map(site => parseInt(String(site.id).replace(/^custom-/, ''), 10))
+        .filter(Number.isFinite),
+    );
     idCounter.current = Math.max(100, highestId + 1);
   };
 
@@ -986,16 +1240,55 @@ export default function PlasmidMapEditor() {
     setNotice({ type: 'success', text: `Saved editable project as “${fileName}”.` });
   };
 
-  const downloadSVG = () => {
+  const createExportSVGMarkup = () => {
     if (!svgRef.current) return;
     const clone = svgRef.current.cloneNode(true);
     clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
     const xml = new XMLSerializer().serializeToString(clone);
+    return `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`;
+  };
+
+  const downloadSVG = () => {
+    const xml = createExportSVGMarkup();
+    if (!xml) return;
     downloadFile(
-      `<?xml version="1.0" encoding="UTF-8"?>\n${xml}`,
+      xml,
       'image/svg+xml',
       `${safeFileName(plasmidName, 'plasmid')}.svg`,
     );
+  };
+
+  const downloadPNG = async () => {
+    const xml = createExportSVGMarkup();
+    if (!xml || !svgRef.current) return;
+    const viewBox = svgRef.current.viewBox.baseVal;
+    const scale = 3;
+    const width = Math.max(1, Math.round(viewBox.width * scale));
+    const height = Math.max(1, Math.round(viewBox.height * scale));
+    const svgBlob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(svgBlob);
+    try {
+      const image = new Image();
+      image.decoding = 'sync';
+      await new Promise((resolve, reject) => {
+        image.onload = resolve;
+        image.onerror = reject;
+        image.src = url;
+      });
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Could not create PNG canvas.');
+      ctx.drawImage(image, 0, 0, width, height);
+      const pngBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      if (!pngBlob) throw new Error('Could not create PNG.');
+      downloadBlob(pngBlob, `${safeFileName(plasmidName, 'plasmid')}.png`);
+    } catch (error) {
+      setNotice({ type: 'error', text: error instanceof Error ? error.message : 'Could not export PNG.' });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
   };
 
   const blankAll = () => {
@@ -1019,7 +1312,9 @@ export default function PlasmidMapEditor() {
     setTerminiLabels(createDefaultTerminiLabels());
     setLinearTitleDistance(229);
     setShowTicks(true);
+    setRestrictionSettings(createDefaultRestrictionSettings());
     setHoveredId(null);
+    setViewport({ zoom: 1, panX: 0, panY: 0 });
     setShowSeqInput(true); // open input ready for paste
   };
 
@@ -1074,6 +1369,15 @@ export default function PlasmidMapEditor() {
     if (total > 1) addTick(total);
     return arr.sort((a, b) => a.p - b.p);
   }, [total]);
+
+  const activeCommonRestrictionSites = restrictionResults.all.filter(site => site.source === 'common' && site.enabled);
+  const inactiveCommonRestrictionSites = restrictionResults.all
+    .filter(site => site.source === 'common' && !site.enabled)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const customRestrictionResults = restrictionResults.all.filter(site => site.source === 'custom');
+  const matchedRestrictionSiteCount = restrictionResults.all.filter(site => site.enabled && site.count > 0).length;
+  const visibleRestrictionMarkerCount = restrictionResults.markers.length;
+  const viewportTransform = `translate(${viewport.panX}px, ${viewport.panY}px) scale(${viewport.zoom})`;
 
   return (
     <div className="w-full h-screen flex flex-col bg-[var(--bg)] text-[var(--ink)] overflow-hidden" style={{
@@ -1142,6 +1446,13 @@ export default function PlasmidMapEditor() {
             title={confirmingBlank ? 'Click again to confirm' : 'Clear sequence, name, annotations, and highlights'}
           >
             <Trash2 size={13} /> {confirmingBlank ? 'Click again to confirm' : 'Blank'}
+          </button>
+          <button
+            onClick={downloadPNG}
+            className="flex items-center gap-1.5 text-[12px] px-3 py-1.5 border border-[var(--border-strong)] rounded-md hover:bg-[var(--ink)] hover:text-[var(--bg)] transition-colors"
+            title="Export a 3x PNG of the active map"
+          >
+            <ImageDown size={13} /> Export PNG
           </button>
           <button
             onClick={downloadSVG}
@@ -1566,6 +1877,148 @@ export default function PlasmidMapEditor() {
               </div>
             </div>
 
+            {/* Restriction sites */}
+            <div className="bg-[var(--bg-tint)] border border-[var(--border)] rounded-lg p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.14em] text-[var(--muted)] font-semibold">Restriction sites</div>
+                  <div className="font-mono text-[10px] text-[var(--muted)] mt-0.5">
+                    {matchedRestrictionSiteCount} matched · {visibleRestrictionMarkerCount} shown
+                  </div>
+                </div>
+                <button
+                  onClick={() => updateRestrictionSettings({ enabled: !restrictionSettings.enabled })}
+                  className="flex items-center gap-1.5 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+                >
+                  {restrictionSettings.enabled ? <Eye size={13} /> : <EyeOff size={13} />}
+                  {restrictionSettings.enabled ? 'Visible' : 'Hidden'}
+                </button>
+              </div>
+
+              <button
+                onClick={() => updateRestrictionSettings({ showLabels: !restrictionSettings.showLabels })}
+                className="flex items-center gap-2 text-[11px] text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+              >
+                {restrictionSettings.showLabels ? <Eye size={12} /> : <EyeOff size={12} />}
+                Site labels {restrictionSettings.showLabels ? 'visible' : 'hidden'}
+              </button>
+
+              <div className="flex border border-[var(--border)] rounded-md overflow-hidden">
+                <SegBtn active={restrictionTab === 'active'} onClick={() => setRestrictionTab('active')}>
+                  Active · {activeCommonRestrictionSites.length + customRestrictionResults.length}
+                </SegBtn>
+                <SegBtn active={restrictionTab === 'common'} onClick={() => setRestrictionTab('common')}>
+                  Common · {inactiveCommonRestrictionSites.length}
+                </SegBtn>
+              </div>
+
+              {restrictionTab === 'active' ? (
+                <div className="pt-2 border-t border-[var(--border)] space-y-3">
+                  <div>
+                    <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Active common sites</div>
+                    {activeCommonRestrictionSites.length === 0 ? (
+                      <div className="text-[11px] text-[var(--muted)] italic py-2 border border-dashed border-[var(--border)] rounded-md text-center">
+                        No common sites active. Add them from the Common tab.
+                      </div>
+                    ) : (
+                      <div className="max-h-32 overflow-y-auto scroll-fade pr-1 space-y-1">
+                        {activeCommonRestrictionSites.map(site => (
+                          <div key={site.id} className="flex items-center gap-2 text-[11px] text-[var(--muted)]">
+                            <button
+                              onClick={() => toggleCommonRestrictionSite(site.id)}
+                              className="text-[var(--muted)] hover:text-[var(--accent)]"
+                              title="Remove from active sites"
+                            >
+                              <EyeOff size={12} />
+                            </button>
+                            <span className="w-14 text-[var(--ink)]">{site.name}</span>
+                            <span className="flex-1 font-mono text-[10px] truncate">{site.sequence}</span>
+                            <span className="font-mono text-[10px]">{site.count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="pt-2 border-t border-[var(--border)] space-y-2">
+                    <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Custom site / sequence</div>
+                    <div className="grid grid-cols-[1fr_1.35fr_auto] gap-1.5">
+                      <Input
+                        value={customRestrictionName}
+                        onChange={e => setCustomRestrictionName(e.target.value)}
+                        placeholder="Name"
+                        className="text-[11px]"
+                      />
+                      <Input
+                        value={customRestrictionSeq}
+                        onChange={e => setCustomRestrictionSeq(e.target.value)}
+                        placeholder="ACGT..."
+                        className="font-mono text-[11px]"
+                      />
+                      <button
+                        onClick={addCustomRestrictionSite}
+                        className="px-2 py-1.5 border border-[var(--border-strong)] rounded-md text-[11px] text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg)] transition-colors"
+                        title="Add custom sequence search"
+                      >
+                        <Plus size={13} />
+                      </button>
+                    </div>
+                    {customRestrictionResults.length > 0 && (
+                      <div className="space-y-1">
+                        {customRestrictionResults.map(site => (
+                          <div key={site.id} className="flex items-center gap-2 text-[11px] text-[var(--muted)]">
+                            <button
+                              onClick={() => toggleCustomRestrictionSite(site.id)}
+                              className="text-[var(--muted)] hover:text-[var(--ink)]"
+                              title={site.enabled === false ? 'Show custom site' : 'Hide custom site'}
+                            >
+                              {site.enabled === false ? <EyeOff size={12} /> : <Eye size={12} />}
+                            </button>
+                            <span className="w-20 truncate text-[var(--ink)]">{site.name}</span>
+                            <span className="flex-1 font-mono text-[10px] truncate">{site.sequence}</span>
+                            <span className="font-mono text-[10px]">{site.count}</span>
+                            <button
+                              onClick={() => removeCustomRestrictionSite(site.id)}
+                              className="text-[var(--muted)] hover:text-[var(--accent)]"
+                              title="Remove custom site"
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="pt-2 border-t border-[var(--border)]">
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-[var(--muted)] mb-1.5 font-medium">Commonly available sites</div>
+                  {inactiveCommonRestrictionSites.length === 0 ? (
+                    <div className="text-[11px] text-[var(--muted)] italic py-2 border border-dashed border-[var(--border)] rounded-md text-center">
+                      All common sites are active.
+                    </div>
+                  ) : (
+                    <div className="max-h-44 overflow-y-auto scroll-fade pr-1 space-y-1">
+                      {inactiveCommonRestrictionSites.map(site => (
+                        <div key={site.id} className="flex items-center gap-2 text-[11px] text-[var(--muted)] hover:text-[var(--ink)]">
+                          <button
+                            onClick={() => toggleCommonRestrictionSite(site.id)}
+                            className="text-[var(--muted)] hover:text-[var(--accent)]"
+                            title="Add to active sites"
+                          >
+                            <Plus size={12} />
+                          </button>
+                          <span className="w-14 text-[var(--ink)]">{site.name}</span>
+                          <span className="flex-1 font-mono text-[10px] truncate">{site.sequence}</span>
+                          <span className="font-mono text-[10px]">{site.count}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
             {/* Annotations list */}
             <div className="space-y-3">
               <div className="flex items-center justify-between">
@@ -1642,9 +2095,40 @@ export default function PlasmidMapEditor() {
         <main
           className="flex-1 flex items-center justify-center min-h-0 p-6 relative overflow-hidden transition-colors"
           style={{ background: theme.bg }}
+          onPointerDown={handleViewportPointerDown}
+          onPointerMove={handleViewportPointerMove}
+          onPointerUp={handleViewportPointerUp}
+          onPointerCancel={handleViewportPointerUp}
         >
+          <div className="absolute top-4 right-4 z-10 bg-[var(--bg)]/95 border border-[var(--border)] rounded-lg shadow-sm p-2 flex items-center gap-1.5">
+            <button
+              onClick={() => zoomViewport(0.85)}
+              className="w-8 h-8 flex items-center justify-center rounded-md text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-tint)]"
+              title="Zoom out"
+            >
+              <ZoomOut size={15} />
+            </button>
+            <div className="font-mono text-[10px] text-[var(--muted)] w-10 text-center">{Math.round(viewport.zoom * 100)}%</div>
+            <button
+              onClick={() => zoomViewport(1.18)}
+              className="w-8 h-8 flex items-center justify-center rounded-md text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-tint)]"
+              title="Zoom in"
+            >
+              <ZoomIn size={15} />
+            </button>
+            <button
+              onClick={resetViewport}
+              className="w-8 h-8 flex items-center justify-center rounded-md text-[var(--muted)] hover:text-[var(--ink)] hover:bg-[var(--bg-tint)]"
+              title="Reset viewport"
+            >
+              <Maximize2 size={14} />
+            </button>
+          </div>
           {isPlasmidView ? (
-            <div className="w-full h-full max-w-[800px] max-h-[800px] aspect-square">
+            <div
+              className="w-full h-full max-w-[800px] max-h-[800px] aspect-square"
+              style={{ transform: viewportTransform, transformOrigin: 'center center' }}
+            >
               <svg
                 ref={svgRef}
                 viewBox={`-${VIEWBOX/2} -${VIEWBOX/2} ${VIEWBOX} ${VIEWBOX}`}
@@ -1670,6 +2154,7 @@ export default function PlasmidMapEditor() {
                       fontFamily={fontFamily}
                       textColor={textColor}
                       currentR={currentR}
+                      onSelect={openHighlight}
                     />
                   ))}
 
@@ -1704,6 +2189,18 @@ export default function PlasmidMapEditor() {
                     </g>
                   ))}
 
+                  {restrictionSettings.enabled && (
+                    <CircularRestrictionSites
+                      sites={restrictionResults.markers}
+                      total={total}
+                      showLabels={restrictionSettings.showLabels}
+                      rotation={rotation}
+                      currentR={currentR}
+                      theme={theme}
+                      fontFamily={fontFamily}
+                    />
+                  )}
+
                   {/* Annotations — rendered on top */}
                   {resolved.filter(a => a.found).map(ann => (
                     <Annotation
@@ -1719,6 +2216,7 @@ export default function PlasmidMapEditor() {
                       labelFontSize={labelFontSize}
                       textColor={textColor}
                       currentR={currentR}
+                      onSelect={openAnnotation}
                     />
                   ))}
                 </g>
@@ -1737,7 +2235,10 @@ export default function PlasmidMapEditor() {
               </svg>
             </div>
           ) : (
-            <div className="w-full h-full max-w-[980px] max-h-[620px] aspect-[820/520]">
+            <div
+              className="w-full h-full max-w-[980px] max-h-[620px] aspect-[820/520]"
+              style={{ transform: viewportTransform, transformOrigin: 'center center' }}
+            >
               <svg
                 ref={svgRef}
                 viewBox={`-${LINEAR_VIEWBOX_W/2} -${LINEAR_VIEWBOX_H/2} ${LINEAR_VIEWBOX_W} ${LINEAR_VIEWBOX_H}`}
@@ -1766,6 +2267,7 @@ export default function PlasmidMapEditor() {
                     total={total}
                     fontFamily={fontFamily}
                     textColor={textColor}
+                    onSelect={openHighlight}
                   />
                 ))}
 
@@ -1800,6 +2302,16 @@ export default function PlasmidMapEditor() {
                   </g>
                 ))}
 
+                {restrictionSettings.enabled && (
+                  <LinearRestrictionSites
+                    sites={restrictionResults.markers}
+                    total={total}
+                    showLabels={restrictionSettings.showLabels}
+                    theme={theme}
+                    fontFamily={fontFamily}
+                  />
+                )}
+
                 {resolved.filter(a => a.found).map(ann => (
                   <LinearAnnotation
                     key={ann.id}
@@ -1812,6 +2324,7 @@ export default function PlasmidMapEditor() {
                     fontFamily={fontFamily}
                     labelFontSize={labelFontSize}
                     textColor={textColor}
+                    onSelect={openAnnotation}
                   />
                 ))}
 
@@ -1844,7 +2357,7 @@ export default function PlasmidMapEditor() {
 }
 
 /* ---------- annotation drawing on the map ---------- */
-function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fontFamily, labelFontSize = 11.5, textColor, rotation = 0, currentR = R_DEFAULT }) {
+function Annotation({ ann, total, isHovered, onHover, onSelect, theme, labelStack = 0, fontFamily, labelFontSize = 11.5, textColor, rotation = 0, currentR = R_DEFAULT }) {
   const { a1, a2 } = computeAngles(ann.start, ann.end, total);
   const sizeScale = ann.sizeScale ?? 1;
   const thickness = BAND_THICKNESS * sizeScale;
@@ -1854,6 +2367,11 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
   const cornerStyle = ann.cornerStyle ?? 'rounded';
   const outlineColor = ann.outlineColor || darken(ann.color, 0.5);
   const outlineWidth = ann.outlineWidth ?? DEFAULT_ANNOTATION_OUTLINE_WIDTH;
+  const handlePointerDown = event => event.stopPropagation();
+  const handleSelect = event => {
+    event.stopPropagation();
+    onSelect?.(ann.id);
+  };
   let pathEl;
   if (ann.shape === 'arrow') {
     const d = cornerStyle === 'rounded'
@@ -1869,9 +2387,12 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
         strokeLinecap={cornerStyle === 'rounded' ? 'round' : 'butt'}
         opacity={1}
         className={isHovered ? 'annotation-hover' : ''}
-        style={{ transition: 'filter 0.15s, opacity 0.15s' }}
+        data-map-interactive="true"
+        style={{ transition: 'filter 0.15s, opacity 0.15s', cursor: 'pointer' }}
+        onPointerDown={handlePointerDown}
         onMouseEnter={() => onHover(ann.id)}
         onMouseLeave={() => onHover(null)}
+        onClick={handleSelect}
       />
     );
   } else if (ann.shape === 'block') {
@@ -1888,9 +2409,12 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
         strokeLinecap={cornerStyle === 'rounded' ? 'round' : 'butt'}
         opacity={1}
         className={isHovered ? 'annotation-hover' : ''}
-        style={{ transition: 'filter 0.15s, opacity 0.15s' }}
+        data-map-interactive="true"
+        style={{ transition: 'filter 0.15s, opacity 0.15s', cursor: 'pointer' }}
+        onPointerDown={handlePointerDown}
         onMouseEnter={() => onHover(ann.id)}
         onMouseLeave={() => onHover(null)}
+        onClick={handleSelect}
       />
     );
   } else {
@@ -1905,9 +2429,12 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
         strokeLinecap="round"
         opacity={1}
         className={isHovered ? 'annotation-hover' : ''}
-        style={{ transition: 'all 0.15s' }}
+        data-map-interactive="true"
+        style={{ transition: 'all 0.15s', cursor: 'pointer' }}
+        onPointerDown={handlePointerDown}
         onMouseEnter={() => onHover(ann.id)}
         onMouseLeave={() => onHover(null)}
+        onClick={handleSelect}
       />
     );
   }
@@ -1938,7 +2465,12 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
     if (cosA > 0.2) anchor = 'start';
     else if (cosA < -0.2) anchor = 'end';
     labelEl = (
-      <g style={{ pointerEvents: 'none' }}>
+      <g
+        data-map-interactive="true"
+        style={{ cursor: 'pointer' }}
+        onPointerDown={handlePointerDown}
+        onClick={handleSelect}
+      >
         <line
           x1={lineStartX} y1={lineStartY} x2={lineEndX} y2={lineEndY}
           stroke={theme.backbone} strokeWidth="0.6" opacity="0.55"
@@ -1961,8 +2493,88 @@ function Annotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fon
   return <g>{pathEl}{labelEl}</g>;
 }
 
+function CircularRestrictionSites({ sites, total, showLabels, rotation = 0, currentR = R_DEFAULT, theme, fontFamily }) {
+  if (!total || sites.length === 0) return null;
+  return (
+    <g>
+      {sites.map(site => {
+        const a = angleAt(site.start, total);
+        const markerInner = currentR + 7;
+        const markerOuter = currentR + 23;
+        const labelR = currentR + 38;
+        const [x1, y1] = polar(a, markerInner);
+        const [x2, y2] = polar(a, markerOuter);
+        const [tx, ty] = polar(a, labelR);
+        const screenA = a + (rotation * Math.PI) / 180;
+        const anchor = Math.cos(screenA) > 0.25 ? 'start' : Math.cos(screenA) < -0.25 ? 'end' : 'middle';
+        const color = site.source === 'custom' ? '#31688e' : '#B8472D';
+        return (
+          <g key={site.id} opacity="0.9">
+            <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={color} strokeWidth="1.1" strokeLinecap="round" />
+            <circle cx={x2} cy={y2} r="2.2" fill={color} />
+            {showLabels && (
+              <text
+                x={tx}
+                y={ty}
+                textAnchor={anchor}
+                dominantBaseline="middle"
+                fontSize="8.5"
+                fill={theme.ink}
+                transform={`rotate(${-rotation} ${tx} ${ty})`}
+                style={{ fontFamily, fontWeight: 600, letterSpacing: '0.02em' }}
+              >
+                {site.name}
+              </text>
+            )}
+          </g>
+        );
+      })}
+    </g>
+  );
+}
+
+function LinearRestrictionSites({ sites, total, showLabels, theme, fontFamily }) {
+  if (!total || sites.length === 0) return null;
+  return (
+    <g>
+      {sites.map((site, index) => {
+        const x = linearBaseX(site.start, total);
+        const labelY = LINEAR_SEQ_Y + 58 + (index % 3) * 13;
+        const color = site.source === 'custom' ? '#31688e' : '#B8472D';
+        return (
+          <g key={site.id} opacity="0.9">
+            <line
+              x1={x}
+              y1={LINEAR_SEQ_Y + 10}
+              x2={x}
+              y2={LINEAR_SEQ_Y + 42}
+              stroke={color}
+              strokeWidth="1"
+              strokeLinecap="round"
+            />
+            <circle cx={x} cy={LINEAR_SEQ_Y + 10} r="2.1" fill={color} />
+            {showLabels && (
+              <text
+                x={x}
+                y={labelY}
+                textAnchor="middle"
+                dominantBaseline="middle"
+                fontSize="8.5"
+                fill={theme.ink}
+                style={{ fontFamily, fontWeight: 600, letterSpacing: '0.02em' }}
+              >
+                {site.name}
+              </text>
+            )}
+          </g>
+        );
+      })}
+    </g>
+  );
+}
+
 /* ---------- highlight: translucent band with curved label ---------- */
-function Highlight({ hl, total, fontFamily, textColor, rotation = 0, currentR = R_DEFAULT }) {
+function Highlight({ hl, total, fontFamily, textColor, rotation = 0, currentR = R_DEFAULT, onSelect }) {
   const { a1, a2 } = computeAngles(hl.start, hl.end, total);
   const sizeScale = hl.sizeScale ?? 3;
   const thickness = BAND_THICKNESS * sizeScale;
@@ -2035,9 +2647,19 @@ function Highlight({ hl, total, fontFamily, textColor, rotation = 0, currentR = 
   })() : null;
 
   const pathId = `hl-path-${hl.id}`;
+  const handlePointerDown = event => event.stopPropagation();
+  const handleSelect = event => {
+    event.stopPropagation();
+    onSelect?.(hl.id);
+  };
 
   return (
-    <g style={{ pointerEvents: 'none' }}>
+    <g
+      data-map-interactive="true"
+      style={{ cursor: 'pointer' }}
+      onPointerDown={handlePointerDown}
+      onClick={handleSelect}
+    >
       <defs>
         <path id={pathId} d={textPathD} fill="none" />
       </defs>
@@ -2242,7 +2864,7 @@ function LinearTermini({ terminiStyle, backboneColor, backboneThickness, labels,
   );
 }
 
-function LinearAnnotation({ ann, total, isHovered, onHover, theme, labelStack = 0, fontFamily, labelFontSize = 11.5, textColor }) {
+function LinearAnnotation({ ann, total, isHovered, onHover, onSelect, theme, labelStack = 0, fontFamily, labelFontSize = 11.5, textColor }) {
   const { x1, x2 } = linearRangeX(ann.start, ann.end, total);
   const sizeScale = ann.sizeScale ?? 1;
   const thickness = BAND_THICKNESS * sizeScale;
@@ -2252,6 +2874,11 @@ function LinearAnnotation({ ann, total, isHovered, onHover, theme, labelStack = 
   const cornerStyle = ann.cornerStyle ?? 'rounded';
   const outlineColor = ann.outlineColor || darken(ann.color, 0.5);
   const outlineWidth = ann.outlineWidth ?? DEFAULT_ANNOTATION_OUTLINE_WIDTH;
+  const handlePointerDown = event => event.stopPropagation();
+  const handleSelect = event => {
+    event.stopPropagation();
+    onSelect?.(ann.id);
+  };
 
   let pathEl;
   if (ann.shape === 'arrow') {
@@ -2264,9 +2891,12 @@ function LinearAnnotation({ ann, total, isHovered, onHover, theme, labelStack = 
         strokeLinejoin={cornerStyle === 'rounded' ? 'round' : 'miter'}
         strokeLinecap={cornerStyle === 'rounded' ? 'round' : 'butt'}
         className={isHovered ? 'annotation-hover' : ''}
-        style={{ transition: 'filter 0.15s, opacity 0.15s' }}
+        data-map-interactive="true"
+        style={{ transition: 'filter 0.15s, opacity 0.15s', cursor: 'pointer' }}
+        onPointerDown={handlePointerDown}
         onMouseEnter={() => onHover(ann.id)}
         onMouseLeave={() => onHover(null)}
+        onClick={handleSelect}
       />
     );
   } else if (ann.shape === 'block') {
@@ -2279,9 +2909,12 @@ function LinearAnnotation({ ann, total, isHovered, onHover, theme, labelStack = 
         strokeLinejoin={cornerStyle === 'rounded' ? 'round' : 'miter'}
         strokeLinecap={cornerStyle === 'rounded' ? 'round' : 'butt'}
         className={isHovered ? 'annotation-hover' : ''}
-        style={{ transition: 'filter 0.15s, opacity 0.15s' }}
+        data-map-interactive="true"
+        style={{ transition: 'filter 0.15s, opacity 0.15s', cursor: 'pointer' }}
+        onPointerDown={handlePointerDown}
         onMouseEnter={() => onHover(ann.id)}
         onMouseLeave={() => onHover(null)}
+        onClick={handleSelect}
       />
     );
   } else {
@@ -2295,9 +2928,12 @@ function LinearAnnotation({ ann, total, isHovered, onHover, theme, labelStack = 
         strokeWidth={isHovered ? lineStroke + 1 : lineStroke}
         strokeLinecap="round"
         className={isHovered ? 'annotation-hover' : ''}
-        style={{ transition: 'all 0.15s' }}
+        data-map-interactive="true"
+        style={{ transition: 'all 0.15s', cursor: 'pointer' }}
+        onPointerDown={handlePointerDown}
         onMouseEnter={() => onHover(ann.id)}
         onMouseLeave={() => onHover(null)}
+        onClick={handleSelect}
       />
     );
   }
@@ -2312,7 +2948,12 @@ function LinearAnnotation({ ann, total, isHovered, onHover, theme, labelStack = 
     const lineStartY = y + side * (visibleHalfThickness + 2);
     const lineEndY = labelY - side * 8;
     labelEl = (
-      <g style={{ pointerEvents: 'none' }}>
+      <g
+        data-map-interactive="true"
+        style={{ cursor: 'pointer' }}
+        onPointerDown={handlePointerDown}
+        onClick={handleSelect}
+      >
         <line
           x1={labelX} y1={lineStartY} x2={labelX} y2={lineEndY}
           stroke={theme.backbone} strokeWidth="0.6" opacity="0.55"
@@ -2334,7 +2975,7 @@ function LinearAnnotation({ ann, total, isHovered, onHover, theme, labelStack = 
   return <g>{pathEl}{labelEl}</g>;
 }
 
-function LinearHighlight({ hl, total, fontFamily, textColor }) {
+function LinearHighlight({ hl, total, fontFamily, textColor, onSelect }) {
   const { x1, x2 } = linearRangeX(hl.start, hl.end, total);
   const sizeScale = hl.sizeScale ?? 3;
   const thickness = BAND_THICKNESS * sizeScale;
@@ -2380,9 +3021,19 @@ function LinearHighlight({ hl, total, fontFamily, textColor }) {
 
   const labelX = x1 + (x2 - x1) * (0.5 + (hl.labelOffset ?? 0) / 100);
   const labelY = y + side * (hl.labelDistance ?? 0);
+  const handlePointerDown = event => event.stopPropagation();
+  const handleSelect = event => {
+    event.stopPropagation();
+    onSelect?.(hl.id);
+  };
 
   return (
-    <g style={{ pointerEvents: 'none' }}>
+    <g
+      data-map-interactive="true"
+      style={{ cursor: 'pointer' }}
+      onPointerDown={handlePointerDown}
+      onClick={handleSelect}
+    >
       <path
         d={linearBlockPath(x1, x2, y, thickness, cornerStyle, cornerRadius)}
         fill={hl.color}
@@ -2416,6 +3067,7 @@ function AnnotationCard({ ann, total, viewMode, onUpdate, onRemove, onHover, isH
   const isLinear = viewMode === 'linear';
   return (
     <div
+      id={`annotation-card-${ann.id}`}
       onMouseEnter={() => onHover(ann.id)}
       onMouseLeave={() => onHover(null)}
       className={`bg-[var(--bg-tint)] border rounded-lg overflow-hidden transition-all ${isHovered ? 'border-[var(--ink)] shadow-sm' : 'border-[var(--border)]'}`}
@@ -2789,7 +3441,7 @@ function HighlightCard({ hl, total, viewMode, onUpdate, onRemove }) {
   const valid = !hl.error;
   const isLinear = viewMode === 'linear';
   return (
-    <div className="bg-[var(--bg-tint)] border border-[var(--border)] rounded-lg overflow-hidden">
+    <div id={`highlight-card-${hl.id}`} className="bg-[var(--bg-tint)] border border-[var(--border)] rounded-lg overflow-hidden">
       <div className="flex items-center px-3 py-2 gap-2 cursor-pointer" onClick={() => onUpdate({ collapsed: !collapsed })}>
         <div className="w-3 h-3 rounded-sm flex-shrink-0" style={{ background: hl.color, opacity: 0.5 }} />
         <div className="flex-1 text-[13px] font-medium truncate">{hl.name || <span className="italic text-[var(--muted)]">unnamed</span>}</div>

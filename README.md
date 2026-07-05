@@ -5,7 +5,7 @@ exportable plasmid and linear sequence diagrams.
 
 The app lets you paste or edit a DNA sequence, add annotated features by
 base-pair position or sequence search, switch between circular and linear
-representations, style the map, and export the active view as an SVG.
+representations, style the map, and export the active view as SVG or PNG.
 
 ## Features
 
@@ -20,10 +20,15 @@ representations, style the map, and export the active view as an SVG.
 - Multi-ring layouts with per-feature formatting controls.
 - Translucent labeled highlight regions with optional boundary
   markers.
+- Optional restriction-site overlay with active/common site tabs, custom
+  sequence searches, and toggleable labels.
 - Toggleable tick marks and tick labels.
+- Editor viewport controls for zoom, pan, and reset.
+- Click map features to open their annotation controls.
 - FASTA and raw DNA file upload, with FASTA headers used as map names.
 - Versioned JSON project save/load plus automatic local browser autosave.
-- SVG export for publication figures, slides, and design notes.
+- SVG and high-resolution PNG export for publication figures, slides, and
+  design notes.
 
 > [!tip]
 Launch plasmid.studio:
