@@ -495,13 +495,20 @@ const createDefaultRestrictionSettings = () => ({
   enabled: false,
   showLabels: true,
   selectedIds: [],
+  hiddenIds: [],
   customSites: [],
 });
 
 const buildRestrictionSiteResults = (sequence, settings, circular) => {
   const selectedIds = new Set(settings.selectedIds || []);
+  const hiddenIds = new Set(settings.hiddenIds || []);
   const commonSites = COMMON_RESTRICTION_SITES
-    .map(site => ({ ...site, source: 'common', enabled: selectedIds.has(site.id) }));
+    .map(site => ({
+      ...site,
+      source: 'common',
+      selected: selectedIds.has(site.id),
+      enabled: selectedIds.has(site.id) && !hiddenIds.has(site.id),
+    }));
   const customSites = (settings.customSites || [])
     .map(site => ({ ...site, source: 'custom', enabled: site.enabled !== false }));
 
@@ -587,6 +594,9 @@ const normalizeRestrictionSettings = (settings, defaults) => {
   const selectedIds = Array.isArray(settings.selectedIds)
     ? settings.selectedIds.filter(id => COMMON_RESTRICTION_SITES.some(site => site.id === id))
     : defaults.selectedIds;
+  const hiddenIds = Array.isArray(settings.hiddenIds)
+    ? settings.hiddenIds.filter(id => COMMON_RESTRICTION_SITES.some(site => site.id === id))
+    : defaults.hiddenIds;
   const customSites = Array.isArray(settings.customSites)
     ? settings.customSites
       .filter(isRecord)
@@ -606,6 +616,7 @@ const normalizeRestrictionSettings = (settings, defaults) => {
     enabled: booleanOr(settings.enabled, defaults.enabled),
     showLabels: booleanOr(settings.showLabels, defaults.showLabels),
     selectedIds,
+    hiddenIds,
     customSites,
   };
 };
@@ -1072,9 +1083,23 @@ export default function PlasmidMapEditor() {
   const toggleCommonRestrictionSite = useCallback((id) => {
     setRestrictionSettings(prev => {
       const selected = new Set(prev.selectedIds || []);
+      const hidden = new Set(prev.hiddenIds || []);
       if (selected.has(id)) selected.delete(id);
-      else selected.add(id);
-      return { ...prev, selectedIds: [...selected] };
+      else {
+        selected.add(id);
+        hidden.delete(id);
+      }
+      return { ...prev, selectedIds: [...selected], hiddenIds: [...hidden].filter(hiddenId => selected.has(hiddenId)) };
+    });
+  }, []);
+
+  const toggleCommonRestrictionVisibility = useCallback((id) => {
+    setRestrictionSettings(prev => {
+      const hidden = new Set(prev.hiddenIds || []);
+      if (hidden.has(id)) hidden.delete(id);
+      else hidden.add(id);
+      const selected = new Set(prev.selectedIds || []);
+      return { ...prev, hiddenIds: [...hidden].filter(hiddenId => selected.has(hiddenId)) };
     });
   }, []);
 
@@ -1370,9 +1395,9 @@ export default function PlasmidMapEditor() {
     return arr.sort((a, b) => a.p - b.p);
   }, [total]);
 
-  const activeCommonRestrictionSites = restrictionResults.all.filter(site => site.source === 'common' && site.enabled);
+  const activeCommonRestrictionSites = restrictionResults.all.filter(site => site.source === 'common' && site.selected);
   const inactiveCommonRestrictionSites = restrictionResults.all
-    .filter(site => site.source === 'common' && !site.enabled)
+    .filter(site => site.source === 'common' && !site.selected)
     .sort((a, b) => a.name.localeCompare(b.name));
   const customRestrictionResults = restrictionResults.all.filter(site => site.source === 'custom');
   const matchedRestrictionSiteCount = restrictionResults.all.filter(site => site.enabled && site.count > 0).length;
@@ -1925,15 +1950,22 @@ export default function PlasmidMapEditor() {
                         {activeCommonRestrictionSites.map(site => (
                           <div key={site.id} className="flex items-center gap-2 text-[11px] text-[var(--muted)]">
                             <button
-                              onClick={() => toggleCommonRestrictionSite(site.id)}
-                              className="text-[var(--muted)] hover:text-[var(--accent)]"
-                              title="Remove from active sites"
+                              onClick={() => toggleCommonRestrictionVisibility(site.id)}
+                              className="text-[var(--muted)] hover:text-[var(--ink)]"
+                              title={site.enabled ? 'Hide common site' : 'Show common site'}
                             >
-                              <EyeOff size={12} />
+                              {site.enabled ? <Eye size={12} /> : <EyeOff size={12} />}
                             </button>
                             <span className="w-14 text-[var(--ink)]">{site.name}</span>
                             <span className="flex-1 font-mono text-[10px] truncate">{site.sequence}</span>
                             <span className="font-mono text-[10px]">{site.count}</span>
+                            <button
+                              onClick={() => toggleCommonRestrictionSite(site.id)}
+                              className="text-[var(--muted)] hover:text-[var(--accent)]"
+                              title="Remove from active sites"
+                            >
+                              <Trash2 size={12} />
+                            </button>
                           </div>
                         ))}
                       </div>
